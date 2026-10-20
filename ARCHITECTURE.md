@@ -81,7 +81,7 @@ manager (Phase 4).
 | Crypto/FHE core | C11 freestanding | Auditable hot math, later SIMD/CLMUL tuning |
 | IPC payload policy | Kernel never inspects | Blind routing is a spec-level property |
 | Phase-1 crypto | AES-256-GCM (C core, NIST-vector-tested) | Tier-1 path; FHE arrives in Phase 3 |
-| Formal specs | Isabelle/HOL, real on day 1 | Capability algebra + IPC abstraction with tracked sorries |
+| Formal specs | Isabelle/HOL, real on day 1 | Capability algebra + IPC abstraction; v0.4.0 sessions build `sorry`-free (ledger: proof/TODO.md) |
 | Git protocol | main + annotated tags at each 25% milestone | Reviewable quarterly pushes |
 
 ## LOC ledger (targets from the approved blueprint)

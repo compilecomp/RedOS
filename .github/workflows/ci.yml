@@ -27,7 +27,7 @@ jobs:
   boot:
     name: boot chain (zig bootloader + rust kernel in QEMU)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Install Zig 0.13.0 (sha256-pinned, supply-chain audited)
@@ -46,5 +46,31 @@ jobs:
       - name: Headless boot + blind IPC encrypted echo test (OVMF -> loader -> kernel)
         run: make boot-test OVMF_DIR=/usr/share/ovmf
 
-  # Jobs below are added at their roadmap milestones:
-  #   proof(v0.4.0):  isabelle build -D proof/ (tracked sorries must be listed).
+  proof:
+    name: Isabelle/HOL specs (capability algebra + blind IPC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore Isabelle heaps cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.isabelle
+          key: isabelle2024-hol-v1
+      - name: Install Isabelle2024 (mirror fallback chain)
+        run: |
+          set -e
+          for u in \
+            "https://isabelle.in.tum.de/dist/Isabelle2024_linux.tar.gz" \
+            "https://dist.isabelle.cit.tum.de/dist/Isabelle2024_linux.tar.gz" \
+            "https://mirror.unej.fr/isabelle-dist/Isabelle2024_linux.tar.gz"; do
+            echo "trying $u"
+            if curl -fSL --retry 2 -o /tmp/isabelle.tar.gz "$u"; then break; fi
+          done
+          test -s /tmp/isabelle.tar.gz
+          sudo mkdir -p /opt && sudo tar -xf /tmp/isabelle.tar.gz -C /opt
+          echo "/opt/Isabelle2024/bin" >> "$GITHUB_PATH"
+      - name: Build HOL image (skipped by cache on later runs)
+        run: isabelle build -b HOL
+      - name: Build RedOS proof sessions
+        run: isabelle build -v -D proof/

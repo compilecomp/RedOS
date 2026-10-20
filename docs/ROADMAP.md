@@ -16,6 +16,12 @@ updated. Each push is an annotated tag `v0.<n>.0`.
 | 75% | v0.3.0 | Capability manager, blind IPC router, two threads | Encrypted echo: A encrypts → blind kernel routes → B decrypts, in QEMU |
 | 100% | v0.4.0 | Isabelle specs (capability algebra, IPC abstraction, invariants), full CI | `isabelle build` green in CI; QEMU test green; Phase 1 milestone closed |
 
+**Phase 1 CLOSED at v0.4.0.** Formal specs: `proof/Cap.thy` (rights lattice,
+mint monotonicity, no-forgery reachability, revocation monotonicity) and
+`proof/IPC.thy` (payload-independence / blindness theorem, endpoint state
+invariants, revoked-capability stutter). Zero `sorry` — see
+`proof/TODO.md` for the accepted model simplifications.
+
 **Phase 1 milestone (blueprint):** "Hello World" where Thread A encrypts a
 message, the kernel routes it blindly, and Thread B decrypts it.
 

@@ -49,7 +49,7 @@ QEMU + OVMF + mtools for boot tests (added with the v0.2.0 milestone).
 | v0.1.0  | Monorepo scaffold, AES-256-GCM core (C) + NIST vectors, docs, CI   | crypto ✓  |
 | v0.2.0  | Zig UEFI bootloader + Rust kernel boots to serial in QEMU          | boot ✓    |
 | v0.3.0  | Capability manager + blind IPC + encrypted echo test (Phase 1 MS)  | ipc ✓     |
-| v0.4.0  | Isabelle specs (cap algebra, blind IPC), full CI, Phase 1 closure  | planned   |
+| v0.4.0  | Isabelle specs (cap algebra, blind IPC), full CI, Phase 1 closure  | proof ✓   |
 
 ## License & standards
 

@@ -1,0 +1,4 @@
+session RedOS_Proofs = HOL +
+  theories
+    Cap
+    IPC
