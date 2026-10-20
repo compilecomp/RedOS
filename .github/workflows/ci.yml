@@ -43,9 +43,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-system-x86 ovmf mtools
-      - name: Headless boot test (OVMF -> bootloader -> kernel banner)
+      - name: Headless boot + blind IPC encrypted echo test (OVMF -> loader -> kernel)
         run: make boot-test OVMF_DIR=/usr/share/ovmf
 
   # Jobs below are added at their roadmap milestones:
-  #   ipc  (v0.3.0):  QEMU encrypted echo test (capability + blind IPC).
   #   proof(v0.4.0):  isabelle build -D proof/ (tracked sorries must be listed).

@@ -41,7 +41,7 @@ if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
     exit 1
 fi
 
-if grep -q "REDOS KERNEL OK" "$LOG" && grep -q "REDOS-BOOT" "$LOG"; then
+if grep -q "REDOS IPC TEST PASS" "$LOG" && grep -q "REDOS IPC TAMPER PASS" "$LOG" && grep -q "REDOS-BOOT" "$LOG"; then
     echo "BOOT TEST PASSED (serial banners verified)"
     grep -E "REDOS-BOOT|RedOS|usable RAM|REDOS KERNEL" "$LOG" | head -12
     exit 0

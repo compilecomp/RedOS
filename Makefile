@@ -69,7 +69,10 @@ freestanding-check: | build
 # NOTE: build from kernel/ so cargo picks up kernel/.cargo/config.toml
 # (target pin, linker script). --manifest-path from the root would skip it.
 kernel: | build
-	cd kernel && cargo build --release
+	$(CC) $(FREE_CFLAGS) -c crypto/src/aes.c -o build/aes.free.o
+	$(CC) $(FREE_CFLAGS) -c crypto/src/gcm.c -o build/gcm.free.o
+	$(AR) rcs build/libredcrypto.free.a build/aes.free.o build/gcm.free.o
+	cd kernel && cargo rustc --release -- -C link-arg=-L../build -C link-arg=-lredcrypto.free
 	cp kernel/target/x86_64-unknown-none/release/redos-kernel build/redos.bin
 
 # Zig UEFI stage-0 bootloader (must match kernel/linker.ld KERNEL_BASE)
