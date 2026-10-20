@@ -1,0 +1,16 @@
+# RedOS kernel build configuration (x86_64-unknown-none).
+#
+# CEP&CC Law 7: target-dependent link behavior lives in exactly this file.
+# relocation-model=static: no dynamic relocations — the bootloader places the
+#   image at fixed physical addresses (see bootloader/src/main.zig).
+# linker.ld: places .text at 0x200000; must match bootloader KERNEL_BASE.
+
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "link-arg=--script=linker.ld",
+    "-C", "link-arg=--no-pie",
+]

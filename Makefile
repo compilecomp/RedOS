@@ -6,6 +6,8 @@
 CC      ?= cc
 AR      ?= ar
 NM      ?= nm
+QEMU    ?= qemu-system-x86_64
+OVMF_DIR ?= /usr/share/OVMF
 
 UNAME_M := $(shell uname -m)
 
@@ -25,9 +27,11 @@ endif
 CRYPTO_SRC   := crypto/src/aes.c crypto/src/gcm.c
 CRYPTO_OBJ   := $(CRYPTO_SRC:crypto/src/%.c=build/%.o)
 CRYPTO_LIB   := build/libredcrypto.a
+KERNEL_ELF   := kernel/target/x86_64-unknown-none/release/redos-kernel
 
-.PHONY: all crypto-test freestanding-check loc clean
-all: crypto-test freestanding-check
+.PHONY: all crypto-test freestanding-check kernel bootloader image qemu \
+        boot-test loc clean
+all: crypto-test freestanding-check kernel bootloader
 
 build/%.o: crypto/src/%.c crypto/include/red/crypto.h | build
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
@@ -58,6 +62,42 @@ freestanding-check: | build
 	   echo "FREESTANDING-CHECK FAILED: non-project undefined symbols:"; echo "$$und"; exit 1; \
 	 fi
 	@echo "FREESTANDING-CHECK OK (no undefined symbols beyond red_* API)"
+
+# --- Phase 1 boot pipeline -------------------------------------------------
+
+# Rust no_std microkernel (zero third-party deps in Phase 1)
+# NOTE: build from kernel/ so cargo picks up kernel/.cargo/config.toml
+# (target pin, linker script). --manifest-path from the root would skip it.
+kernel: | build
+	cd kernel && cargo build --release
+	cp kernel/target/x86_64-unknown-none/release/redos-kernel build/redos.bin
+
+# Zig UEFI stage-0 bootloader (must match kernel/linker.ld KERNEL_BASE)
+bootloader: | build
+	zig build-exe bootloader/src/main.zig -target x86_64-uefi \
+	    -O ReleaseSafe -femit-bin=build/BOOTX64.EFI
+
+# FAT ESP image: BOOTX64.EFI + kernel ELF at \redos.bin
+image: bootloader kernel | build
+	truncate -s 16M build/esp.img
+	mformat -i build/esp.img -C -h 32 -t 32 -s 32 ::
+	mmd -i build/esp.img ::/EFI ::/EFI/BOOT
+	mcopy -i build/esp.img build/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i build/esp.img build/redos.bin ::/redos.bin
+	@echo "ESP image ready: build/esp.img"
+
+# Interactive boot (serial console on stdout; Ctrl-C to quit)
+qemu: image
+	cp $(OVMF_DIR)/OVMF_VARS_4M.fd build/OVMF_VARS.fd
+	$(QEMU) -machine q35 -m 512M -display none -no-reboot -serial stdio \
+	    -L $${QEMU_DATA_DIR:-/usr/share/qemu} \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_DIR)/OVMF_CODE_4M.fd \
+	    -drive if=pflash,format=raw,file=build/OVMF_VARS.fd \
+	    -drive format=raw,file=build/esp.img
+
+# Headless boot test: asserts bootloader + kernel serial banner (CI target)
+boot-test: image
+	OVMF_DIR=$(OVMF_DIR) scripts/boot_test.sh
 
 # LOC ledger per component (raw line counts; see docs/ROADMAP.md targets)
 loc:

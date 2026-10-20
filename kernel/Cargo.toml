@@ -1,0 +1,23 @@
+[package]
+name = "redos-kernel"
+version = "0.2.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "RedOS verified microkernel — the blind TCB (Phase 1)"
+
+# CEP&CC note: the kernel builds with ZERO third-party dependencies in
+# Phase 1. Every mechanism (serial driver, port I/O, panic path) is
+# first-party and auditable. Dependencies are added only with a written
+# justification in ARCHITECTURE.md (Law 1: no hidden cost).
+
+[[bin]]
+name = "redos-kernel"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+lto = false
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
+debug = true
