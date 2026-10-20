@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  crypto:
+    name: crypto core (C, host + freestanding)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build & run KAT + NIST GCM + tamper + contract tests
+        run: make crypto-test
+      - name: Freestanding compile + undefined-symbol check
+        run: make freestanding-check
+      - name: LOC ledger
+        run: make loc
+
+  # Jobs below are added at their roadmap milestones:
+  #   boot (v0.2.0):  build Zig bootloader + Rust kernel, boot OVMF/QEMU,
+  #                   assert serial banner.
+  #   ipc  (v0.3.0):  QEMU encrypted echo test (capability + blind IPC).
+  #   proof(v0.4.0):  isabelle build -D proof/ (tracked sorries must be listed).

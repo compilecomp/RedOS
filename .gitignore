@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.img
+*.elf
+*.efi
+*.iso
+*.fd
+zig-cache/
+zig-out/
+target/
+**/target/
+
+# Tooling
+*.log
+.gdb_history
+perf.data*
+
+# Environment / secrets (never commit tokens)
+.env
+*.token
