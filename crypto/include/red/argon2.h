@@ -15,6 +15,15 @@
  * because RFC 9106 defines Argon2id's first half-pass in terms of it).
  *
  * Version policy: only version 0x13 (current) is accepted.
+ *
+ * Side-channel note (explicit, tracked): past the first half-pass,
+ * Argon2id's data-dependent memory indexing is inherent to the RFC
+ * 9106 specification (that is WHY the first half-pass is Argon2i-
+ * style) — a timing side channel on the reference-set reads exists by
+ * design for every conforming implementation. The GB arithmetic is
+ * constant-time on this target (64-bit integer mul/add, no data-
+ * dependent branches or table lookups). Callers threat-model this per
+ * docs/ARCHITECTURE.md (local attacker; cold-boot focus).
  */
 #ifndef RED_ARGON2_H
 #define RED_ARGON2_H

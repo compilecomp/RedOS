@@ -141,7 +141,9 @@ pub fn write_sector(n: usize, data: &[u8; SECTOR_SIZE]) -> Result<(), DiskError>
 ///
 /// CEP: CEP-1 | Complete
 /// Cost: O(1) copy.
-/// Fail: BadSector; panics on a missing disk (caller contract).
+/// Fail: panics (named) on a missing disk or an out-of-range sector —
+///       this is a diagnostic channel with a caller-side contract
+///       (the I/O path returns named errors instead; see read_sector).
 pub fn raw_sector(n: usize, out: &mut [u8; SECTOR_SIZE]) {
     unsafe {
         if !DISK.present {

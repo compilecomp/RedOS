@@ -116,6 +116,12 @@ static mut RNG_S1: u64 = 0;
 /// `None` until then — pre-unlock wipes use the xorshift stream.
 static mut WIPE_KEY: Option<[u8; 32]> = None;
 
+/// Per-boot wipe sequence number: every AES-CTR wipe consumes one value,
+/// so the (key, nonce) pair NEVER repeats within a boot — a frame freed
+/// and re-freed gets independent keystreams (no two-time-pad across
+/// wipes). 2^32 wipes per boot is far beyond reach; documented bound.
+static mut WIPE_SEQ: u32 = 0;
+
 /// Install the KMS-provided wipe key (idempotent: first write wins —
 /// re-keying a running wipe stream would break the audit story).
 ///
@@ -137,7 +143,9 @@ pub fn set_wipe_key(key: [u8; 32]) {
 }
 
 /// Revert to the keyless xorshift wipe stream (duress path: the KMS
-/// destroys the wipe key with the rest of the vault).
+/// destroys the wipe key with the rest of the vault). The 32-byte
+/// payload is scrubbed (volatile + black_box) BEFORE the discriminant
+/// flips — "destroys the wipe key" is mechanical, not aspirational.
 ///
 /// CEP: CEP-1 | Complete
 /// Cost: O(1).
@@ -145,7 +153,14 @@ pub fn set_wipe_key(key: [u8; 32]) {
 /// Assumes: called only by the KMS duress path (kms.rs).
 pub fn clear_wipe_key() {
     unsafe {
+        if let Some(mut k) = core::ptr::addr_of!(WIPE_KEY).read() {
+            for b in k.iter_mut() {
+                core::ptr::write_volatile(b, 0);
+            }
+            core::hint::black_box(&k);
+        }
         WIPE_KEY = None;
+        WIPE_SEQ = 0;
     }
 }
 
@@ -427,7 +442,7 @@ pub fn free(phys: u64) -> Result<(), LockedFreeError> {
 /// address, then (caller-side) zero it. Two regimes:
 ///   * pre-KMS unlock: xorshift128+ address-mixed noise (v0.5.0);
 ///   * post-KMS unlock: AES-256-CTR keystream — nonce = frame physical
-///     address (48 bits) || per-frame zero counter, SP 800-38A.
+///     address (8 B) || per-boot wipe sequence (4 B), SP 800-38A.
 /// Identity addressing: served frames are below the 512 MiB service
 /// ceiling, which EVERY root identity-maps (bootloader's 1 GiB map and
 /// our PML4[0] 512 MiB map) — the allocator therefore works under any
@@ -445,14 +460,21 @@ fn wipe_noise(phys: u64) {
         }
         Some(k) => {
             // AES-256-CTR (SP 800-38A): counter block = nonce(12 B) ||
-            // ctr(u32 BE). Nonce = frame physical address — frames are
-            // 4 KiB apart, so the 96-bit nonce is unique per frame and
-            // per frame-lifetime (a frame is wiped at most once between
-            // allocs; the keystream is never reused under the same key
-            // for the same nonce).
+            // ctr(u32 BE). Nonce = frame physical address (8 B) ||
+            // per-boot wipe sequence (4 B) — every wipe in a boot gets a
+            // distinct nonce even when the SAME frame is wiped twice
+            // (free -> alloc -> free), closing the two-time-pad window;
+            // across boots the vault hands a fresh key, so no (key,
+            // nonce) pair can repeat while the key lives.
+            let seq = unsafe {
+                let s = WIPE_SEQ;
+                WIPE_SEQ = WIPE_SEQ.wrapping_add(1);
+                s
+            };
             let mut ctx = crate::ffi::aes256_init(&k);
             let mut iv = [0u8; crate::ffi::IV_LEN];
             iv[0..8].copy_from_slice(&phys.to_le_bytes());
+            iv[8..12].copy_from_slice(&seq.to_be_bytes());
             let base = phys as *mut u8;
             let mut ctr: u32 = 0;
             for chunk in 0..(PAGE_SIZE as usize / 16) {

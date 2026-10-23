@@ -71,6 +71,14 @@ spirit; the ledger is reviewed at every quarterly push.
    atomic in the model). In the kernel the wipe is a sequence, but the
    cooperative single-CPU model gives no observer a scheduling point
    inside it (same argument as item 7).
+13. `Kms.thy` divergences from kms.rs recorded for honesty (all benign,
+   none load-bearing): (a) the duress branch does not bump `vatt` — the
+   kernel increments ATTEMPTS to MAX before wiping, so `attempts_used()`
+   reads 3 after duress where the model freezes at 2; (b) `ok v
+   (KUnlock _)` means "attempt serviced", not "vault opened" — the
+   theorems about outcomes use the state-machine consequences instead;
+   (c) lease use does not distinguish NoSuchLease from Expired (both
+   refuse; the kernel's named errors are finer-grained than the model).
 
 ## Next proof targets (Phase 2+)
 

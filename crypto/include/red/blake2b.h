@@ -12,6 +12,11 @@
  * as the lease/domain key-derivation PRF. A break here is a break of
  * every KMS guarantee — the KATs in tests/crypto/test_vectors.c pin
  * the exact RFC 7693 behavior (empty, "abc", block boundaries, keyed).
+ *
+ * Side-channel note (explicit, tracked): BLAKE2b is constant-time by
+ * construction — the message schedule SIGMA and the IV are input-
+ * independent, so every memory access pattern is fixed. No table
+ * lookup depends on secret data.
  */
 #ifndef RED_BLAKE2B_H
 #define RED_BLAKE2B_H

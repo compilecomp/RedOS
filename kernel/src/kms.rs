@@ -485,16 +485,19 @@ pub fn unlock(pin: &[u8]) -> Result<(), UnlockError> {
         STATE = VaultState::Unlocked;
 
         // Upgrade the allocator's wipe stream (KMS-owned key).
-        let wk = match read_master() {
+        let mut wk = match read_master() {
             Ok(m) => m,
             Err(_) => {
                 return Err(UnlockError::Crypto("STATE"));
             }
         };
         let mut wipe_key = derive_subkey(&wk, b"redos/wipe/v1", &[]);
+        // The master-key COPY leaves via the scrub (B1 fix, v0.6.0 review):
+        // only the Locked-frame resident survives, as the module contract
+        // promises.
+        wipe_bytes(&mut wk);
         phys::set_wipe_key(wipe_key);
         wipe_bytes(&mut wipe_key);
-        let _ = wk;
         Ok(())
     }
 }
@@ -686,13 +689,16 @@ pub fn blob_frame_phys() -> u64 {
     unsafe { BLOB_FRAME }
 }
 
-/// Best-effort byte-slice scrub (volatile writes; the compiler cannot
-/// elide them, and release builds keep the loop because the memory is
-/// later re-read by tests — the duress banner verifies zeroization).
+/// Security scrub: volatile stores (mechanically unelidable — LLVM must
+/// perform every one) plus a black_box fence so no optimizer pass can
+/// reason the zeros away. Every key copy the vault holds on a stack
+/// exits through this function; the duress banner verifies the frame
+/// zeroization empirically (256-word sweep in the boot scenario).
 fn wipe_bytes(buf: &mut [u8]) {
     for b in buf.iter_mut() {
-        *b = 0;
+        unsafe { core::ptr::write_volatile(b, 0) };
     }
+    core::hint::black_box(buf);
 }
 
 #[cold]

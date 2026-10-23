@@ -149,11 +149,13 @@ pub extern "C" fn _start(boot: &Handoff) -> ! {
         ep, cap_a, cap_b
     ));
 
-    // kmain's slot 0 is NEVER a scheduling target: mark it non-Runnable so
-    // schedule_from/yield_tick scans can never resume the abandoned
-    // scheduler_run frame (v0.6.0 bring-up lesson: with 3+ tasks the scan
-    // wraps to slot 0 and resuming kmain's half-dead frame corrupts the
-    // cooperative handoff — see worklog).
+    // kmain's slot 0 is NEVER a scheduling target — a documented
+    // invariant, made explicit here as defense in depth: the scan in
+    // schedule_from/yield_tick selects Runnable slots only, and slot 0
+    // is born Free (never spawnable), so the marking is belt-and-
+    // suspenders for any future state-machine change (v0.6.0 bring-up
+    // drove this home: a yield that halts when alone — schedule_from —
+    // is the wrong primitive for a clock tick; see yield_tick).
     tasks()[0].state = task::TaskState::Dead;
 
     // Spawn B first: it builds its root, maps its private page, and blocks
@@ -592,13 +594,15 @@ extern "C" fn vault_c(_arg: u64) -> ! {
     }
     let mut back = [0u8; ramdisk::SECTOR_SIZE];
     let mut raw = [0u8; ramdisk::SECTOR_SIZE];
+    let mut roundtrip_ok = false;
     match ramdisk::read_sector(sector, &mut back) {
         Ok(()) => {
             if back == DISK_PATTERN {
                 serial::print(format_args!(
-                    "[C] sector {} read back: 512/512 bytes match\n",
+                    "[C] sector {} read back: 512/512 bytes match\nREDOS RAMDISK ROUND-TRIP PASS\n",
                     sector
                 ));
+                roundtrip_ok = true;
             } else {
                 let mut diff = 0usize;
                 for i in 0..ramdisk::SECTOR_SIZE {
@@ -618,13 +622,19 @@ extern "C" fn vault_c(_arg: u64) -> ! {
     let plaintext_leak = raw == DISK_PATTERN;
     if !plaintext_leak {
         serial::print(format_args!(
-            "[C] at-rest bytes of sector {} are ciphertext (raw != plaintext)\nREDOS RAMDISK ROUND-TRIP PASS\nREDOS RAMDISK CIPHERTEXT PASS\n",
+            "[C] at-rest bytes of sector {} are ciphertext (raw != plaintext)\nREDOS RAMDISK CIPHERTEXT PASS\n",
             sector
         ));
     } else {
         serial::print(format_args!(
             "[C] FAIL: sector stored as PLAINTEXT — encryption at rest broken\n"
         ));
+    }
+    if !roundtrip_ok {
+        // Round-trip already printed its FAIL line; keep the evidence
+        // chain honest by refusing the downstream duress assertions.
+        serial::print(format_args!("[C] FAIL: disk round-trip failed — aborting scenario\n"));
+        task::task_exit(me);
     }
 
     // --- 5. duress: the counter's final wrong PIN destroys the vault ----------

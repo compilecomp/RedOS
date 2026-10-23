@@ -60,7 +60,8 @@ again; transfer pairing). Zero `sorry`.
   XTS-AES-256 (IEEE 1619-2007 Annex B 512-byte data-unit vector; NIST
   SP 800-38E subset — partial data units get a named error, never
   improvised ciphertext stealing). AES-256 gained the FIPS-197 inverse
-  cipher for XTS. 56 host tests + link-level freestanding check.
+  cipher for XTS. 92 test assertions (60 check sites) + link-level
+  freestanding check.
 * **Kernel vault (kms.rs).** Master key generated at boot (RDRAND with
   CPUID guard; documented weak TSC fallback for QEMU's default CPU),
   sealed immediately as `GCM(master)` under `Argon2id(PIN, salt)` — a

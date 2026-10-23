@@ -25,7 +25,7 @@ text \<open>
     duress) both refuse. The QEMU scenario asserts the empirical half
     (the VaultDead error after the duress banner).
 
-  Model simplifications are recorded in proof/TODO.md (items 8--11);
+  Model simplifications are recorded in proof/TODO.md (items 9--12);
   the load-bearing one is that PIN correctness is an authenticated
   unwrap (GCM tag under the Argon2id KEK), so a ``correct PIN'' command
   is by construction the only command that can move Sealed to Unlocked.
