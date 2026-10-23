@@ -54,12 +54,30 @@ spirit; the ledger is reviewed at every quarterly push.
    scheduler): `CAcc` events stand for whatever the running task does, and
    admission is purely the MMU predicate. Ring-3 user/supervisor split
    (fast-path milestone) will extend the model with an execution mode.
+9. `Kms.thy` models PIN correctness as an abstract boolean command
+   (`KUnlock pin`). The cryptographic half — that only the Argon2id KEK
+   of the true PIN verifies the sealed blob's GCM tag — is pinned by the
+   RFC 9106 KAT in tests/crypto (Law 3 division of labor: the theorem
+   owns the state machine, the KAT owns the crypto).
+10. `Kms.thy` lease expiry is lazy and tick-based (ticks = context
+   switches, monotone). Wall-clock leases (timer interrupts) would need
+   the fast-path milestone's interrupt model first; monotone ticks are
+   the conservative approximation (expiry can only come earlier).
+11. `Kms.thy` does not model the Argon2id arena's CONTENT (password-
+   derived intermediate blocks): the arena's wipe-after-attempt is
+   enforced by the kernel (`scrub_arena`) and covered by `Mem.thy`'s
+   locked-forever + wipe-before-reuse theorems for the frames it spans.
+12. `Kms.thy` treats VWiping as a guard state only (the duress wipe is
+   atomic in the model). In the kernel the wipe is a sequence, but the
+   cooperative single-CPU model gives no observer a scheduling point
+   inside it (same argument as item 7).
 
 ## Next proof targets (Phase 2+)
 
 - Task state machine: no Dead-but-resumable, no Runnable-with-stale-context.
 - Scheduler liveness under cooperative semantics.
-- KMS state machine: duress counter, destroyed-vault fail-closed (with the
-  v0.6.0 KMS — extends `Mem.thy`'s Locked-class theorems).
-- XTS sector encryption: tweak independence (with the v0.6.0 RAM disk).
+- KMS state machine: DONE at v0.6.0 (`Kms.thy`: duress counter,
+  destroyed-vault fail-closed, lease lazy expiry, unlock outcomes).
+- XTS sector encryption: tweak independence (with the v0.7.0 storage
+  hardening; the IEEE 1619 KAT pins the crypto half meanwhile).
 - Manifest spawner: hash-mismatch refusal is monotone (with v0.7.0).

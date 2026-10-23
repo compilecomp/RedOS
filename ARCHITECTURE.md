@@ -66,12 +66,35 @@ The coding standard is CEP&CC 0.1 (`standard.md` at repository root).
     mints the receiver's capability token — the kernel copies a 24-byte
     descriptor, never the payload. `revoke()` zeroes the CNode slot AND
     tears down the PTEs (with `invlpg` when the affected root is loaded).
+  - *RAM-only KMS vault* (`kms.rs`, v0.6.0): sealed-blob unlock (GCM tag
+    under the Argon2id KEK), wrong-PIN budget enforced in every live
+    state, duress dead-man wipe (terminal), BLAKE2b domain-separated
+    lease keys with tick-TTL lazy expiry. Master/blob/arena are Locked
+    frames; only the vault (owner) ever zeroes them.
+  - *XTS RAM disk* (`ramdisk.rs`, v0.6.0): 512 B sectors as IEEE 1619
+    data units, per-op derived keys, fail-closed I/O outside Unlocked,
+    encryption-at-rest asserted in the boot scenario (raw bytes are
+    ciphertext).
 
 ### Layer 2 — Userspace runtime & crypto engines — Rust + C
 - **Capability-aware libc**: minimal, `no_std`-compatible core (Phase 2).
-- **KMS (RAM-only vault)**: Argon2id(PIN + hardware salt) → master AES-256 key
-  in mlocked memory; HKDF sub-keys per object; wipe protocol overwrites pages
-  before free; keys never hit disk (Phase 2).
+- **KMS (RAM-only vault, v0.6.0 — real)**: master key born at boot
+  (RDRAND with CPUID guard; documented weak TSC fallback in QEMU) and
+  immediately sealed as `GCM(master)` under `Argon2id(PIN, salt)` — a
+  RAM-only vault has no stored PIN verifier, so PIN correctness IS the
+  authenticated unwrap. Master, sealed blob, and the 8 MiB Argon2id
+  arena live in Locked-class frames (the mlock mandate is structural,
+  `Mem.thy`-proven). Wrong-PIN attempts are counted in every live state
+  (hammering an open vault counts); the budget-satisfying attempt fires
+  the duress dead-man wipe — every secret zeroized, terminal `Dead`
+  state — before any crypto runs (`Kms.thy`: monotone counter, Dead is
+  terminal, fail-closed outcomes). Sub-keys (disk, leases, wipe stream)
+  are keyed-BLAKE2b domain-separated derivations; disk keys are derived
+  per operation and zeroized after use. Lease TTLs tick with scheduler
+  context switches (lazy expiry: first use past expiry wipes the key).
+  XTS-AES-256 (SP 800-38E subset) encrypts the RAM disk at rest; the
+  allocator's wipe stream upgrades to AES-256-CTR keyed from the vault
+  on unlock and reverts at duress.
 - **Homomorphic Compute Engine (HCE)**: background thread pool executing FHE
   circuits (Tier-2 only). C math core (`crypto/`, NTT/polynomial rings) bound
   via FFI from the Rust service (Phase 3). The HCE never holds decryption keys.

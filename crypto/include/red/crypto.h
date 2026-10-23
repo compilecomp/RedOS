@@ -40,7 +40,7 @@ extern "C" {
 
 /* AES-256 block cipher context: 15 round keys, 240 bytes. */
 typedef struct {
-	uint8_t roundkeys[240];
+        uint8_t roundkeys[240];
 } red_aes256_ctx;
 
 /* AES S-box, exported for test-time independent verification (Law 3). */
@@ -62,6 +62,19 @@ int red_aes256_init(red_aes256_ctx *ctx, const uint8_t key[RED_CRYPTO_KEY_LEN]);
  *          ctx was initialized by red_aes256_init.
  */
 void red_aes256_encrypt_block(const red_aes256_ctx *ctx,
+                              const uint8_t in[RED_CRYPTO_BLOCK_LEN],
+                              uint8_t out[RED_CRYPTO_BLOCK_LEN]);
+
+/*
+ * CEP: CEP-1 | Complete
+ * Cost: fixed 14 inverse rounds (FIPS-197 5.3); 16 B in / 16 B out.
+ * Fail: cannot fail.
+ * Assumes: in and out do not partially overlap (exact aliasing is fine);
+ *          ctx was initialized by red_aes256_init.
+ * Notes: added in v0.6.0 for XTS-AES-256 (storage mode). GCM remains the
+ *          comms mode and never calls this path.
+ */
+void red_aes256_decrypt_block(const red_aes256_ctx *ctx,
                               const uint8_t in[RED_CRYPTO_BLOCK_LEN],
                               uint8_t out[RED_CRYPTO_BLOCK_LEN]);
 

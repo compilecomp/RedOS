@@ -1,31 +1,32 @@
-//! RedOS kernel — entry point (Phase 2, milestone v0.5.0: Memory Physics).
+//! RedOS kernel — entry point (Phase 2, milestone v0.6.0: RAM-Only KMS
+//! Vault).
 //!
-//! The Phase-2 scenario implements Pillar 2 end to end with two kernel
-//! threads in isolated address spaces:
+//! Tasks A/B carry the v0.5.0 memory-physics milestone (isolation, wipe,
+//! lock, zero-copy, revoke — kept green unchanged). Task C exercises the
+//! vault end to end:
 //!
-//!   Task A (producer, root_A)                    Task B (consumer, root_B)
-//!   -------------------------                    -------------------------
-//!   1. private page @ PRIV_BASE                  1. private page @ PRIV_ALT
-//!   2. probe B's page → #PF → denied             2. block on blind IPC recv
-//!   3. WIPE protocol test                        3. read ct via SHM keyhole
-//!   4. LOCK (mlock mandate) test                    decrypt → ZERO-COPY PASS
-//!   5. encrypt into SHM block                    4. kill switch: revoke cap
-//!      (kernel never touches bytes)                 + unmap → probe → #PF
-//!   6. transfer (A demoted to RO,                   → REVOKE PASS
-//!      B mapped RW, token minted)              5. REDOS MEMPHY TEST COMPLETE
-//!   7. send 24-byte descriptor (blind)
-//!   8. verify own write-demotion
+//!   Task C (vault client, root inherited from kmain)
+//!   ------------------------------------------------
+//!   1. wrong PIN #1 -> tag failure, counter 1 (2 left)
+//!   2. correct PIN -> GCM unwrap OK -> master in Locked frame
+//!   3. lease: grant(ttl=2) -> use OK -> 2 switches -> use EXPIRED
+//!   4. XTS RAM disk: write s5 -> read s5 -> round-trip;
+//!      raw sector bytes != plaintext (encryption at rest)
+//!   5. wrong PIN #2 -> counter hits budget -> DURESS dead-man wipe
+//!      (master/blob/arena/leases zeroized, terminal Dead)
+//!   6. disk read after duress -> VaultDead (fail-closed)
 //!
-//! CI banners (asserted by scripts/boot_test.sh):
-//!   REDOS MEMPHY ISOLATION PASS   — cross-root probe denied by the MMU
-//!   REDOS MEMPHY WIPE PASS        — freed frame carries no residue
-//!   REDOS MEMPHY LOCK PASS        — locked frame refuses the free path
-//!   REDOS MEMPHY ZERO-COPY PASS   — payload moved by capability, not copy
-//!   REDOS MEMPHY REVOKE PASS      — post-revocation access is a #PF
-//!   REDOS MEMPHY TEST COMPLETE    — all six observed in one boot
+//! CI banners (asserted by scripts/boot_test.sh, in addition to MEMPHY):
+//!   REDOS KMS SEAL PASS            — wrong PIN rejected, counter honest
+//!   REDOS KMS UNLOCK PASS          — correct PIN unwraps; mlock held
+//!   REDOS KMS LEASE PASS           — lease grant/use/expiry lifecycle
+//!   REDOS RAMDISK ROUND-TRIP PASS  — XTS sector write/read verified
+//!   REDOS RAMDISK CIPHERTEXT PASS  — at-rest bytes are ciphertext
+//!   REDOS KMS DURESS PASS          — dead-man wipe + fail-closed I/O
+//!   REDOS KMS TEST COMPLETE        — all observed in one boot
 //!
 //! CEP: CEP-1 | Complete (Phase 2 scope)
-//! Cost: cold boot path + the two test tasks; all output via polled UART.
+//! Cost: cold boot path + Argon2id seal at init + three task bodies.
 //! Fail: panics (named, serial) on any handoff/IPC/crypto/MMU contract
 //!       breach; FAIL lines (not panics) mark failed test assertions so
 //!       the CI log records them verbatim.
@@ -42,7 +43,9 @@ mod cap;
 mod ffi;
 mod handoff;
 mod ipc;
+mod kms;
 mod mm;
+mod ramdisk;
 mod serial;
 mod shm;
 mod task;
@@ -58,10 +61,14 @@ use mm::idt;
 use mm::pagemap::{self, hhdm, hhdm_mut, PRIV_ALT, PRIV_BASE, SHM_BASE};
 use mm::phys::{self, PageClass, PAGE_SIZE};
 
-/// Phase-2 test key. v0.6.0 replaces this with the RAM-only KMS vault
-/// (Argon2id-derived, mlocked arena, duress-wiped). Until then the key is
-/// a compile-time constant — acceptable ONLY because Phase 2 has no
-/// persistent storage and no external interfaces (documented decision).
+/// Phase-2 test PIN. v0.7.0 replaces this with the input service (real
+/// PIN entry); until then the PIN is a compile-time test constant — the
+/// SAME honesty note as v0.5.0's TEST_KEY, which still governs the A/B
+/// IPC demo (the STORAGE path is now keyless-at-rest: every disk key is
+/// derived from the vault, never from a constant).
+const TEST_PIN: &[u8] = b"sovereign-pin-01";
+const WRONG_PIN: &[u8] = b"wrong-pin-0000";
+/// Comms-crypto demo key for the A/B zero-copy path (unchanged scope).
 const TEST_KEY: [u8; KEY_LEN] = [0x42; KEY_LEN];
 const TEST_IV: [u8; IV_LEN] = [0x07; IV_LEN];
 const PLAINTEXT: &[u8] = b"SOVEREIGN-ZERO-COPY-FROM-REDOS-PHASE2";
@@ -71,6 +78,7 @@ const PLAINTEXT: &[u8] = b"SOVEREIGN-ZERO-COPY-FROM-REDOS-PHASE2";
 /// boundary; values are written once by kmain before any task runs.
 static TASK_A: AtomicUsize = AtomicUsize::new(0);
 static TASK_B: AtomicUsize = AtomicUsize::new(0);
+static TASK_C: AtomicUsize = AtomicUsize::new(0);
 
 /// Per-task capability tables (minted by kmain/transfer; tasks use them
 /// per the cooperative single-writer model).
@@ -95,7 +103,7 @@ static SHM_SLOT_B: AtomicUsize = AtomicUsize::new(0);
 pub extern "C" fn _start(boot: &Handoff) -> ! {
     serial::init();
 
-    serial::print(format_args!("\n=== RedOS v0.5.0 kernel (Memory Physics) ===\n"));
+    serial::print(format_args!("\n=== RedOS v0.6.0 kernel (RAM-Only KMS Vault) ===\n"));
 
     if let Err(reason) = boot.validate() {
         panic_str("handoff rejected: ", reason);
@@ -121,6 +129,10 @@ pub extern "C" fn _start(boot: &Handoff) -> ! {
     }
     serial::print(format_args!("[boot] crypto core selftest OK\n"));
 
+    // --- RAM-only KMS vault (seals a fresh master key under the PIN) ------
+    // Argon2id seal runs here (~8 MiB, t=2 — the boot pays it once).
+    kms::init(TEST_PIN);
+
     // --- Phase 2 milestone wiring -----------------------------------------
     let ep = ipc::create_endpoint();
     EP.store(ep, Ordering::Relaxed);
@@ -137,13 +149,22 @@ pub extern "C" fn _start(boot: &Handoff) -> ! {
         ep, cap_a, cap_b
     ));
 
+    // kmain's slot 0 is NEVER a scheduling target: mark it non-Runnable so
+    // schedule_from/yield_tick scans can never resume the abandoned
+    // scheduler_run frame (v0.6.0 bring-up lesson: with 3+ tasks the scan
+    // wraps to slot 0 and resuming kmain's half-dead frame corrupts the
+    // cooperative handoff — see worklog).
+    tasks()[0].state = task::TaskState::Dead;
+
     // Spawn B first: it builds its root, maps its private page, and blocks
     // on recv — so A's cross-space probe and transfer are deterministic.
     let b = task::spawn(memphy_b, 0);
     TASK_B.store(b, Ordering::Relaxed);
     let a = task::spawn(memphy_a, 0);
     TASK_A.store(a, Ordering::Relaxed);
-    serial::print(format_args!("[boot] tasks spawned: A={} B={}\n", a, b));
+    let c = task::spawn(vault_c, 0);
+    TASK_C.store(c, Ordering::Relaxed);
+    serial::print(format_args!("[boot] tasks spawned: A={} B={} C={}\n", a, b, c));
 
     task::scheduler_run()
 }
@@ -429,6 +450,244 @@ extern "C" fn memphy_b(_arg: u64) -> ! {
     }
 
     serial::print(format_args!("[B] done\nREDOS MEMPHY TEST COMPLETE\n"));
+    task::task_exit(me)
+}
+
+// --- Task C: RAM-only KMS vault scenario ------------------------------------
+
+/// Sector pattern for the XTS round-trip (recognizable, not self-symmetric
+/// under 16-byte alignment: every 16-byte block differs).
+const DISK_PATTERN: [u8; ramdisk::SECTOR_SIZE] = {
+    let mut p = [0u8; ramdisk::SECTOR_SIZE];
+    let mut i = 0;
+    while i < ramdisk::SECTOR_SIZE {
+        p[i] = (i as u8).wrapping_mul(0x5B).wrapping_add(0x11);
+        i += 1;
+    }
+    p
+};
+
+/// Task C: seal/counter, unlock, lease lifecycle, XTS disk round-trip,
+/// encryption-at-rest evidence, duress dead-man wipe, fail-closed reads.
+/// CEP: CEP-1 | Complete
+/// Cost: four unlock calls (3 run Argon2id, the duress one refuses before
+///       crypto); 2 BLAKE2b per disk op; O(1) leases.
+/// Fail: FAIL lines for assertion breaches (recorded by CI); panics on
+///       kernel-contract breaches (fail-fast).
+extern "C" fn vault_c(_arg: u64) -> ! {
+    let me = TASK_C.load(Ordering::Relaxed);
+    use kms::{KmsError, UnlockError};
+
+    serial::print(format_args!(
+        "[C] vault status: {} (attempts used: {})\n",
+        kms::status(),
+        kms::attempts_used()
+    ));
+
+    // --- 1. wrong PIN: tag failure, counter honest ---------------------------
+    match kms::unlock(WRONG_PIN) {
+        Err(UnlockError::WrongPin { remaining }) => {
+            serial::print(format_args!(
+                "[C] wrong PIN #1 rejected by GCM tag ({} attempts left)\n",
+                remaining
+            ));
+            if remaining == kms::MAX_ATTEMPTS - 1 {
+                serial::print(format_args!("REDOS KMS SEAL PASS\n"));
+            } else {
+                serial::print(format_args!("[C] FAIL: counter wrong ({})\n", remaining));
+            }
+        }
+        Err(UnlockError::Dead) => {
+            serial::print(format_args!("[C] FAIL: vault died on attempt #1\n"));
+        }
+        Err(other) => {
+            serial::print(format_args!("[C] FAIL: unexpected unlock error {:?}\n", other));
+        }
+        Ok(()) => {
+            serial::print(format_args!("[C] FAIL: wrong PIN ACCEPTED\n"));
+        }
+    }
+
+    // --- 2. correct PIN: GCM unwrap, mlock held ------------------------------
+    match kms::unlock(TEST_PIN) {
+        Ok(()) => {
+            let mf = kms::master_frame_phys();
+            let bf = kms::blob_frame_phys();
+            let mclass = phys::class_of(mf);
+            let bclass = phys::class_of(bf);
+            serial::print(format_args!(
+                "[C] vault {} (attempts used: {}); master frame {:#x} class={:?}, blob frame {:#x} class={:?}\n",
+                kms::status(),
+                kms::attempts_used(),
+                mf,
+                mclass,
+                bf,
+                bclass
+            ));
+            if mclass == PageClass::Locked && bclass == PageClass::Locked {
+                serial::print(format_args!("REDOS KMS UNLOCK PASS\n"));
+            } else {
+                serial::print(format_args!(
+                    "[C] FAIL: key frames not Locked (m/{:?} b/{:?})\n",
+                    mclass, bclass
+                ));
+            }
+        }
+        Err(other) => {
+            serial::print(format_args!(
+                "[C] FAIL: correct PIN rejected: {:?}\n",
+                other
+            ));
+        }
+    }
+
+    // --- 3. lease lifecycle: grant -> use -> expire ---------------------------
+    match kms::lease_grant(2) {
+        Ok(id) => {
+            match kms::lease_use(id) {
+                Ok(k) => {
+                    let nonzero = k.iter().any(|&b| b != 0);
+                    serial::print(format_args!(
+                        "[C] lease {} granted and used (key nonzero: {})\n",
+                        id, nonzero
+                    ));
+                }
+                Err(e) => serial::print(format_args!("[C] FAIL: fresh lease denied {:?}\n", e)),
+            }
+            // Two scheduler switches: ticks advance (any interleaving with
+            // A/B only advances ticks further — expiry is monotone).
+            // yield_tick, not schedule_from: a self-switch still bumps the
+            // tick, and the yield can never halt when A/B are already done.
+            task::yield_tick(me);
+            task::yield_tick(me);
+            match kms::lease_use(id) {
+                Err(KmsError::Expired) => {
+                    serial::print(format_args!(
+                        "[C] lease expired after budget: key zeroized, use denied\nREDOS KMS LEASE PASS\n"
+                    ));
+                }
+                Ok(_) => {
+                    serial::print(format_args!("[C] FAIL: expired lease STILL USABLE\n"));
+                }
+                Err(e) => {
+                    serial::print(format_args!("[C] FAIL: lease error {:?}\n", e));
+                }
+            }
+        }
+        Err(e) => serial::print(format_args!("[C] FAIL: lease grant {:?}\n", e)),
+    }
+
+    // --- 4. XTS RAM disk: round-trip + encryption-at-rest evidence ------------
+    ramdisk::create();
+    let sector = 5usize;
+    match ramdisk::write_sector(sector, &DISK_PATTERN) {
+        Ok(()) => serial::print(format_args!(
+            "[C] sector {} written (XTS-AES-256, data unit = sector number)\n",
+            sector
+        )),
+        Err(e) => {
+            serial::print(format_args!("[C] FAIL: disk write: {:?}\n", e));
+            task::task_exit(me);
+        }
+    }
+    let mut back = [0u8; ramdisk::SECTOR_SIZE];
+    let mut raw = [0u8; ramdisk::SECTOR_SIZE];
+    match ramdisk::read_sector(sector, &mut back) {
+        Ok(()) => {
+            if back == DISK_PATTERN {
+                serial::print(format_args!(
+                    "[C] sector {} read back: 512/512 bytes match\n",
+                    sector
+                ));
+            } else {
+                let mut diff = 0usize;
+                for i in 0..ramdisk::SECTOR_SIZE {
+                    if back[i] != DISK_PATTERN[i] {
+                        diff += 1;
+                    }
+                }
+                serial::print(format_args!(
+                    "[C] FAIL: round-trip mismatch ({} bytes differ)\n",
+                    diff
+                ));
+            }
+        }
+        Err(e) => serial::print(format_args!("[C] FAIL: disk read: {:?}\n", e)),
+    }
+    ramdisk::raw_sector(sector, &mut raw);
+    let plaintext_leak = raw == DISK_PATTERN;
+    if !plaintext_leak {
+        serial::print(format_args!(
+            "[C] at-rest bytes of sector {} are ciphertext (raw != plaintext)\nREDOS RAMDISK ROUND-TRIP PASS\nREDOS RAMDISK CIPHERTEXT PASS\n",
+            sector
+        ));
+    } else {
+        serial::print(format_args!(
+            "[C] FAIL: sector stored as PLAINTEXT — encryption at rest broken\n"
+        ));
+    }
+
+    // --- 5. duress: the counter's final wrong PIN destroys the vault ----------
+    match kms::unlock(WRONG_PIN) {
+        Err(UnlockError::Dead) => {
+            serial::print(format_args!(
+                "[C] wrong PIN #3 (budget): dead-man wipe fired -> vault {}\n",
+                kms::status()
+            ));
+        }
+        Err(UnlockError::WrongPin { remaining }) => {
+            serial::print(format_args!(
+                "[C] FAIL: expected DURESS at budget, got WrongPin ({} left)\n",
+                remaining
+            ));
+        }
+        other => {
+            serial::print(format_args!("[C] FAIL: unexpected duress result {:?}\n", other));
+        }
+    }
+    // Evidence: master frame zeroized, class still Locked (owner-only path).
+    let mf = kms::master_frame_phys();
+    let mut residue = 0usize;
+    for k in 0..(PAGE_SIZE / 8) {
+        let p = hhdm(mf + k * 8) as *const u64;
+        if unsafe { p.read_volatile() } != 0 {
+            residue += 1;
+        }
+    }
+    let mclass_after = phys::class_of(mf);
+    if residue == 0 && mclass_after == PageClass::Locked && kms::status() == "DEAD" {
+        serial::print(format_args!(
+            "[C] master frame zeroized ({} residue words), still Locked, vault DEAD\n",
+            residue
+        ));
+    } else {
+        serial::print(format_args!(
+            "[C] FAIL: duress incomplete (residue={}, class={:?}, state={})\n",
+            residue, mclass_after, kms::status()
+        ));
+    }
+
+    // --- 6. fail-closed I/O after duress --------------------------------------
+    match ramdisk::read_sector(sector, &mut back) {
+        Err(ramdisk::DiskError::VaultDead) => {
+            serial::print(format_args!(
+                "[C] disk read after duress denied (VaultDead) — fail-closed\nREDOS KMS DURESS PASS\nREDOS KMS TEST COMPLETE\n"
+            ));
+        }
+        Ok(()) => {
+            serial::print(format_args!(
+                "[C] FAIL: disk read SUCCEEDED after duress — key material survived\n"
+            ));
+        }
+        Err(e) => {
+            serial::print(format_args!(
+                "[C] FAIL: expected VaultDead, got {:?}\n",
+                e
+            ));
+        }
+    }
+
+    serial::print(format_args!("[C] done\n"));
     task::task_exit(me)
 }
 

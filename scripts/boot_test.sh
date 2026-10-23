@@ -47,12 +47,19 @@ if grep -q "REDOS MEMPHY ISOLATION PASS" "$LOG" \
    && grep -q "REDOS MEMPHY ZERO-COPY PASS" "$LOG" \
    && grep -q "REDOS MEMPHY REVOKE PASS" "$LOG" \
    && grep -q "REDOS MEMPHY TEST COMPLETE" "$LOG" \
+   && grep -q "REDOS KMS SEAL PASS" "$LOG" \
+   && grep -q "REDOS KMS UNLOCK PASS" "$LOG" \
+   && grep -q "REDOS KMS LEASE PASS" "$LOG" \
+   && grep -q "REDOS RAMDISK ROUND-TRIP PASS" "$LOG" \
+   && grep -q "REDOS RAMDISK CIPHERTEXT PASS" "$LOG" \
+   && grep -q "REDOS KMS DURESS PASS" "$LOG" \
+   && grep -q "REDOS KMS TEST COMPLETE" "$LOG" \
    && grep -q "REDOS-BOOT" "$LOG" \
    && ! grep -q "FAIL:" "$LOG" \
    && ! grep -q "KERNEL PANIC" "$LOG" \
    && ! grep -q "KERNEL FAULT" "$LOG"; then
-    echo "BOOT TEST PASSED (memory-physics banners verified)"
-    grep -aE "REDOS-BOOT|RedOS|usable RAM|ephemeral|paging live|IDT live|MEMPHY" "$LOG" | head -16
+    echo "BOOT TEST PASSED (memory-physics + KMS vault banners verified)"
+    grep -aE "REDOS-BOOT|RedOS|usable RAM|ephemeral|paging live|IDT live|MEMPHY|KMS|disk" "$LOG" | head -22
     exit 0
 fi
 

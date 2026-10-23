@@ -11,11 +11,14 @@
 
 /// Declared kernel external surface (substring-level names; the audit
 /// scans for storage-path indicators: ahci/nvme/ata_/sdhci).
-pub const EXPORTED_SYMBOLS: [&str; 6] = [
+pub const EXPORTED_SYMBOLS: [&str; 7] = [
     "uart16550(port-io)",       // serial console (the only I/O)
     "aes-gcm(xts-none)",        // C core, comms crypto (no storage mode)
     "pagemap(mmu)",             // MMU management
     "ephemeral-alloc(ram)",     // RAM-only allocator
     "ipc(blind-router)",        // capability IPC
-    "kms(pending-v0.6)",        // RAM-only KMS vault (v0.6.0)
+    "kms(argon2id-vault)",      // RAM-only KMS vault (v0.6.0: sealed blob,
+                                //  duress dead-man wipe, BLAKE2b-KDF leases)
+    "ramdisk(xts-256-volatile)",// XTS RAM disk — RAM frames only, no block
+                                //  device, no persistence path (v0.6.0)
 ];

@@ -4,3 +4,4 @@ session RedOS_Proofs = HOL +
     IPC
     Mem
     Revoke
+    Kms

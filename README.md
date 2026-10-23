@@ -6,7 +6,7 @@ RedOS is a capability-based, formally specified microkernel operating system wit
 compute). The kernel is a *blind* TCB: it routes ciphertext, enforces
 capabilities, and never inspects payloads.
 
-Status: **Phase 1 — The Blind Core** (see [docs/ROADMAP.md](docs/ROADMAP.md)).
+Status: **Phase 2 — The RAM-Only Vault & Memory Physics** (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 
 ## Core tenets
 
@@ -15,8 +15,12 @@ Status: **Phase 1 — The Blind Core** (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 2. **Tiered privacy** — Tier 1: AES-256-GCM everywhere (FS, network, app state).
    Tier 2: FHE (CKKS/BFV) for compute where plaintext must never exist in RAM.
 3. **Ephemeral key sovereignty** — master keys live only in mlocked RAM,
-   derived (Argon2id + HKDF) from a local PIN/biometric + hardware salt, wiped
-   on power loss.
+   derived (Argon2id, RFC 9106) from a local PIN + hardware salt, wiped
+   on power loss. v0.6.0 makes this real: the vault seals the master key
+   as an authenticated blob under the PIN-derived KEK (a RAM-only vault
+   has no stored verifier — PIN correctness IS the GCM tag), counts
+   wrong-PIN attempts in every live state, and destroys itself at budget
+   (duress dead-man wipe, terminal `Dead`, all I/O fails closed).
 4. **Minimal verified TCB** — the kernel is mechanism-only, target 8,000–12,000 LOC
    (hard cap 15,000), with Isabelle/HOL specifications in `proof/`.
 
@@ -33,7 +37,8 @@ Status: **Phase 1 — The Blind Core** (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 ## Build (host, no root required)
 
 ```sh
-make crypto-test     # build + run NIST GCM vectors (host)
+make crypto-test     # build + run the KAT suite (FIPS-197, NIST GCM,
+                     # RFC 7693 BLAKE2b, RFC 9106 Argon2id, IEEE 1619 XTS)
 make freestanding-check  # compile crypto core freestanding (kernel-grade flags)
 make loc             # LOC ledger per component
 ```
@@ -51,6 +56,7 @@ QEMU + OVMF + mtools for boot tests (added with the v0.2.0 milestone).
 | v0.3.0  | Capability manager + blind IPC + encrypted echo test (Phase 1 MS)  | ipc ✓     |
 | v0.4.0  | Isabelle specs (cap algebra, blind IPC), full CI, Phase 1 closure  | proof ✓   |
 | v0.5.0  | Memory physics: paging, ephemeral allocator, wipe protocol, zero-copy SHM + MMU-enforced revocation (Phase 2 open) | memphy ✓  |
+| v0.6.0  | RAM-only KMS vault: BLAKE2b + Argon2id (RFC 9106 KAT) + XTS-AES-256 (IEEE 1619 KAT), sealed-blob PIN unlock in Locked frames, wrong-PIN dead-man wipe, tick leases, XTS RAM disk | kms ✓     |
 
 ## License & standards
 

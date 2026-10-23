@@ -125,6 +125,21 @@ const fn new_task() -> Task {
 // Scheduler cursor (round-robin scan start).
 static mut SCHED_CURSOR: usize = 0;
 
+/// Monotone scheduler tick: one bump per context switch. This is the ONLY
+/// clock the KMS vault gets (no timer interrupt exists in Phase 2 —
+/// interrupts are disabled), which makes lease expiry deterministic and
+/// provable: leases expire strictly in switch order (proof/Kms.thy).
+/// 64-bit at ~10^6 switches/s: no wrap concern (2^64 switches).
+static mut SCHED_TICKS: u64 = 0;
+
+/// Current scheduler tick (monotone; one tick per context switch).
+/// CEP: CEP-1 | Complete
+/// Cost: one load.
+/// Fail: cannot fail.
+pub fn ticks() -> u64 {
+    unsafe { SCHED_TICKS }
+}
+
 /// CEP: CEP-0-candidate | Complete (Phase 1)
 /// Cost: fixed 15 instructions; saves/restores all callee-saved GPRs.
 /// Fail: cannot fail (no memory faults possible: both Context pointers are
@@ -229,6 +244,7 @@ unsafe fn write_stack(addr: u64, val: u64) {
 /// semantics is the entire point of the stack-image design.
 pub fn switch_to_task(cur: usize, next: usize) {
     debug_assert!(cur < MAX_TASKS && next < MAX_TASKS, "switch index OOB");
+    unsafe { SCHED_TICKS += 1; }
     let slots = tasks();
     let root = slots[next].cr3;
     if root != 0 && root != crate::mm::pagemap::current_cr3() {
@@ -280,6 +296,37 @@ pub fn scheduler_run() -> ! {
                 crate::halt_forever();
             }
         }
+    }
+}
+
+/// Cooperative tick-yield: switch to the next runnable task (possibly
+/// THIS task — a self-switch still loads CR3-free, saves/restores the
+/// same context, and bumps the scheduler tick). This is the clock tick
+/// primitive for lease expiry (kms.rs): unlike `schedule_from`, it NEVER
+/// halts when the caller is the only runnable task and NEVER picks the
+/// abandoned kmain slot (slot 0 is marked non-Runnable at boot).
+///
+/// CEP: CEP-1 | Complete
+/// Cost: one context switch (or a self-switch: same cost class).
+/// Fail: cannot fail (the caller is Runnable by definition, so the scan
+///       always finds at least one target).
+/// Assumes: called from a Runnable task; cooperative single-CPU.
+pub fn yield_tick(cur: usize) {
+    let slots = tasks();
+    let mut picked: Option<usize> = None;
+    for off in 0..MAX_TASKS {
+        let i = (cur + off) % MAX_TASKS;
+        if matches!(slots[i].state, TaskState::Runnable) {
+            picked = Some(i);
+            break;
+        }
+    }
+    if let Some(next) = picked {
+        unsafe { SCHED_CURSOR = (next + 1) % MAX_TASKS };
+        switch_to_task(cur, next);
+    } else {
+        // Unreachable: the caller is Runnable and `off` 0 includes it.
+        crate::halt_forever()
     }
 }
 

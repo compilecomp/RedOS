@@ -24,16 +24,19 @@ ifeq ($(UNAME_M),x86_64)
 FREE_CFLAGS += -mno-red-zone -mno-mmx -mno-sse -mno-sse2
 endif
 
-CRYPTO_SRC   := crypto/src/aes.c crypto/src/gcm.c
+CRYPTO_SRC   := crypto/src/aes.c crypto/src/gcm.c crypto/src/blake2b.c \
+                crypto/src/argon2.c crypto/src/xts.c
 CRYPTO_OBJ   := $(CRYPTO_SRC:crypto/src/%.c=build/%.o)
 CRYPTO_LIB   := build/libredcrypto.a
 KERNEL_ELF   := kernel/target/x86_64-unknown-none/release/redos-kernel
 
 .PHONY: all crypto-test freestanding-check kernel bootloader image qemu \
-        boot-test loc clean
+	boot-test loc clean
 all: crypto-test freestanding-check kernel bootloader
 
-build/%.o: crypto/src/%.c crypto/include/red/crypto.h | build
+build/%.o: crypto/src/%.c crypto/include/red/crypto.h \
+           crypto/include/red/blake2b.h crypto/include/red/argon2.h \
+           crypto/include/red/xts.h | build
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
 
 build:
@@ -56,10 +59,13 @@ crypto-test: build/test_vectors
 freestanding-check: | build
 	$(CC) $(FREE_CFLAGS) -c crypto/src/aes.c -o build/aes.free.o
 	$(CC) $(FREE_CFLAGS) -c crypto/src/gcm.c -o build/gcm.free.o
-	@und=$$($(NM) build/aes.free.o build/gcm.free.o | awk '$$1=="U"{print $$2}' | sort -u \
-	   | grep -v '^red_'); \
+	$(CC) $(FREE_CFLAGS) -c crypto/src/blake2b.c -o build/blake2b.free.o
+	$(CC) $(FREE_CFLAGS) -c crypto/src/argon2.c -o build/argon2.free.o
+	$(CC) $(FREE_CFLAGS) -c crypto/src/xts.c -o build/xts.free.o
+	@und=$$($(NM) build/aes.free.o build/gcm.free.o build/blake2b.free.o build/argon2.free.o build/xts.free.o | awk '$$1=="U"{print $$2}' | sort -u \
+           | grep -v '^red_'); \
 	 if [ -n "$$und" ]; then \
-	   echo "FREESTANDING-CHECK FAILED: non-project undefined symbols:"; echo "$$und"; exit 1; \
+           echo "FREESTANDING-CHECK FAILED: non-project undefined symbols:"; echo "$$und"; exit 1; \
 	 fi
 	@echo "FREESTANDING-CHECK OK (no undefined symbols beyond red_* API)"
 
@@ -71,14 +77,17 @@ freestanding-check: | build
 kernel: | build
 	$(CC) $(FREE_CFLAGS) -c crypto/src/aes.c -o build/aes.free.o
 	$(CC) $(FREE_CFLAGS) -c crypto/src/gcm.c -o build/gcm.free.o
-	$(AR) rcs build/libredcrypto.free.a build/aes.free.o build/gcm.free.o
+	$(CC) $(FREE_CFLAGS) -c crypto/src/blake2b.c -o build/blake2b.free.o
+	$(CC) $(FREE_CFLAGS) -c crypto/src/argon2.c -o build/argon2.free.o
+	$(CC) $(FREE_CFLAGS) -c crypto/src/xts.c -o build/xts.free.o
+	$(AR) rcs build/libredcrypto.free.a build/aes.free.o build/gcm.free.o build/blake2b.free.o build/argon2.free.o build/xts.free.o
 	cd kernel && cargo rustc --release -- -C link-arg=-L../build -C link-arg=-lredcrypto.free
 	cp kernel/target/x86_64-unknown-none/release/redos-kernel build/redos.bin
 
 # Zig UEFI stage-0 bootloader (must match kernel/linker.ld KERNEL_BASE)
 bootloader: | build
 	zig build-exe bootloader/src/main.zig -target x86_64-uefi \
-	    -O ReleaseSafe -femit-bin=build/BOOTX64.EFI
+            -O ReleaseSafe -femit-bin=build/BOOTX64.EFI
 
 # FAT ESP image: BOOTX64.EFI + kernel ELF at \redos.bin
 image: bootloader kernel | build
@@ -93,10 +102,10 @@ image: bootloader kernel | build
 qemu: image
 	cp $(OVMF_DIR)/OVMF_VARS_4M.fd build/OVMF_VARS.fd
 	$(QEMU) -machine q35 -m 512M -display none -no-reboot -serial stdio \
-	    -L $${QEMU_DATA_DIR:-/usr/share/qemu} \
-	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_DIR)/OVMF_CODE_4M.fd \
-	    -drive if=pflash,format=raw,file=build/OVMF_VARS.fd \
-	    -drive format=raw,file=build/esp.img
+            -L $${QEMU_DATA_DIR:-/usr/share/qemu} \
+            -drive if=pflash,format=raw,readonly=on,file=$(OVMF_DIR)/OVMF_CODE_4M.fd \
+            -drive if=pflash,format=raw,file=build/OVMF_VARS.fd \
+            -drive format=raw,file=build/esp.img
 
 # Headless boot test: asserts bootloader + kernel serial banner (CI target)
 boot-test: image
@@ -107,11 +116,11 @@ loc:
 	@printf "%-14s %8s\n" COMPONENT LOC
 	@printf "%-14s %8s\n" ---------- --------
 	@for d in bootloader kernel crypto proof tests; do \
-	   if [ -d "$$d" ]; then \
-	     n=$$(find $$d -type f \( -name '*.c' -o -name '*.h' -o -name '*.rs' \
-	        -o -name '*.zig' -o -name '*.thy' \) -exec cat {} + 2>/dev/null | wc -l); \
-	     printf "%-14s %8s\n" $$d $$n; \
-	   fi; \
+           if [ -d "$$d" ]; then \
+             n=$$(find $$d -type f \( -name '*.c' -o -name '*.h' -o -name '*.rs' \
+                -o -name '*.zig' -o -name '*.thy' \) -exec cat {} + 2>/dev/null | wc -l); \
+             printf "%-14s %8s\n" $$d $$n; \
+           fi; \
 	 done
 
 clean:

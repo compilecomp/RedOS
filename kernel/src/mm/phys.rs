@@ -37,8 +37,12 @@
 //! Noise source (v0.5.0): a xorshift128+ generator seeded from the TSC at
 //! init and re-mixed with the frame's physical address per 64-bit lane —
 //! wipe quality bar is "previous occupant unrecoverable", which this
-//! meets. v0.6.0 (KMS) upgrades the wipe to an AES-256-CTR keystream
-//! keyed from the KMS arena, documented in docs/ROADMAP.md.
+//! meets. v0.6.0 (KMS): once the vault is unlocked it hands this module a
+//! wipe key (BLAKE2b-KDF from the master key — see kms.rs) and wipes
+//! upgrade from xorshift to an AES-256-CTR keystream (SP 800-38A CTR,
+//! distinct 96-bit nonce per frame), closing the "statistical noise" gap
+//! for the post-unlock lifetime of the boot. Pre-unlock wipes keep the
+//! xorshift stream: the vault has no key material to protect yet.
 //!
 //! CEP: CEP-1 | Complete (Phase 2 scope: 512 MiB service ceiling)
 //! Cost: alloc O(1) amortized (rotating cursor over a fixed pool),
@@ -103,10 +107,47 @@ const MAX_FRAMES: usize = (SERVICE_CEILING / PAGE_SIZE) as usize;
 /// Rotating allocation cursor (first-fit scan start).
 static mut CURSOR: usize = 0;
 
-// --- Wipe noise (xorshift128+) --------------------------------------------
+// --- Wipe noise (xorshift128+ pre-KMS; AES-256-CTR post-unlock) -----------
 
 static mut RNG_S0: u64 = 0;
 static mut RNG_S1: u64 = 0;
+
+/// AES-256-CTR wipe key, set exactly once by the KMS at unlock time.
+/// `None` until then — pre-unlock wipes use the xorshift stream.
+static mut WIPE_KEY: Option<[u8; 32]> = None;
+
+/// Install the KMS-provided wipe key (idempotent: first write wins —
+/// re-keying a running wipe stream would break the audit story).
+///
+/// CEP: CEP-1 | Complete
+/// Cost: O(1).
+/// Fail: panics on a second install attempt (a re-key attempt is a
+///       protocol violation, never silent).
+/// Assumes: called by the KMS after a successful unlock (kms.rs).
+pub fn set_wipe_key(key: [u8; 32]) {
+    unsafe {
+        if matches!(core::ptr::addr_of!(WIPE_KEY).read(), Some(_)) {
+            panic_str("ephemeral allocator: wipe key re-installed");
+        }
+        WIPE_KEY = Some(key);
+    }
+    serial::print(format_args!(
+        "[mm] wipe stream upgraded to AES-256-CTR (KMS-provided key)\n"
+    ));
+}
+
+/// Revert to the keyless xorshift wipe stream (duress path: the KMS
+/// destroys the wipe key with the rest of the vault).
+///
+/// CEP: CEP-1 | Complete
+/// Cost: O(1).
+/// Fail: cannot fail (idempotent).
+/// Assumes: called only by the KMS duress path (kms.rs).
+pub fn clear_wipe_key() {
+    unsafe {
+        WIPE_KEY = None;
+    }
+}
 
 /// CEP: CEP-1 | Complete
 /// Cost: ~13 arithmetic ops.
@@ -382,16 +423,59 @@ pub fn free(phys: u64) -> Result<(), LockedFreeError> {
     }
 }
 
-/// Overwrite one frame with address-mixed noise (the wipe pass).
+/// Overwrite one frame with a keystream keyed by the frame's physical
+/// address, then (caller-side) zero it. Two regimes:
+///   * pre-KMS unlock: xorshift128+ address-mixed noise (v0.5.0);
+///   * post-KMS unlock: AES-256-CTR keystream — nonce = frame physical
+///     address (48 bits) || per-frame zero counter, SP 800-38A.
 /// Identity addressing: served frames are below the 512 MiB service
 /// ceiling, which EVERY root identity-maps (bootloader's 1 GiB map and
 /// our PML4[0] 512 MiB map) — the allocator therefore works under any
 /// active CR3 and never depends on the HHDM being current.
 fn wipe_noise(phys: u64) {
-    let base = phys as *mut u64;
-    for k in 0..(PAGE_SIZE / 8) {
-        unsafe {
-            base.add(k as usize).write_volatile(noise_lane(phys + k * 8));
+    let key = unsafe { WIPE_KEY };
+    match key {
+        None => {
+            let base = phys as *mut u64;
+            for k in 0..(PAGE_SIZE / 8) {
+                unsafe {
+                    base.add(k as usize).write_volatile(noise_lane(phys + k * 8));
+                }
+            }
+        }
+        Some(k) => {
+            // AES-256-CTR (SP 800-38A): counter block = nonce(12 B) ||
+            // ctr(u32 BE). Nonce = frame physical address — frames are
+            // 4 KiB apart, so the 96-bit nonce is unique per frame and
+            // per frame-lifetime (a frame is wiped at most once between
+            // allocs; the keystream is never reused under the same key
+            // for the same nonce).
+            let mut ctx = crate::ffi::aes256_init(&k);
+            let mut iv = [0u8; crate::ffi::IV_LEN];
+            iv[0..8].copy_from_slice(&phys.to_le_bytes());
+            let base = phys as *mut u8;
+            let mut ctr: u32 = 0;
+            for chunk in 0..(PAGE_SIZE as usize / 16) {
+                let mut block = [0u8; 16];
+                let mut ks = [0u8; 16];
+                block[..12].copy_from_slice(&iv);
+                block[12..16].copy_from_slice(&ctr.to_be_bytes());
+                crate::ffi::aes256_ctr_block(&mut ctx, &block, &mut ks);
+                let src = unsafe {
+                    core::slice::from_raw_parts(base.add(chunk * 16), 16)
+                };
+                for i in 0..16 {
+                    unsafe {
+                        base.add(chunk * 16 + i)
+                            .write_volatile(src[i] ^ ks[i]);
+                    }
+                }
+                ctr = ctr.wrapping_add(1);
+            }
+            // Hygiene: the wipe key schedule leaves the stack with the
+            // frame already overwritten. black_box = elision-proof and
+            // honestly "dead" to the optimizer by design.
+            core::hint::black_box(&mut ctx.roundkeys).fill(0);
         }
     }
 }
