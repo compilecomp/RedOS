@@ -25,28 +25,57 @@ invariants, revoked-capability stutter). Zero `sorry` — see
 **Phase 1 milestone (blueprint):** "Hello World" where Thread A encrypts a
 message, the kernel routes it blindly, and Thread B decrypts it.
 
-## Phase 2 — The RAM-Only Vault & AES runtime (next cycle)
+## Phase 2 — The RAM-Only Vault & Memory Physics (current cycle; scope widened: no LOC ceiling)
 
-Userspace boots; KMS derives keys from PIN (Argon2id + HKDF) into mlocked
-pages; encrypted RAM-disk FS uses per-file sub-keys. Milestone: boot, enter
-PIN, create file, reboot, enter PIN, read file; keys never touch disk.
+The user directive for this cycle: **no hard LOC limit — build the full
+redOS.** The quarterly cadence and the independent-review gate are unchanged;
+only the scope ceiling is lifted.
 
-Hardening items carried into Phase 2 (explicit, from v0.1.0 review):
-- AES S-box cache-timing hardening (bitsliced or CLMUL path), re-class CEP-0
-  with disassembly + benchmark evidence.
-- Secret-zeroization review: verify wipe stores are not elided (linker/
-  compiler-level analysis), upgrade to a verified wipe primitive.
+| Push | Tag | Scope | Exit criteria |
+|------|-----|-------|---------------|
+| 25% | v0.5.0 | **Memory physics** (Pillar 2): 4-level paging + HHDM, per-task CR3 roots, Ephemeral Page Allocator (classification, wipe protocol, mlock mandate, anti-swap audit), IDT + #PF probe protocol, zero-copy shared memory with CNode kill switch (write-demotion on transfer, MMU-enforced revocation) | Six MEMPHY banners in QEMU: isolation, wipe, lock, zero-copy, revoke, complete; `Mem.thy` + `Revoke.thy` sorry-free |
+| 50% | v0.6.0 | **RAM-only KMS vault** (Pillar 2): Argon2id (RFC 9106, C core + KAT vectors), PIN → master key into Locked-class frames, XTS-encrypted RAM disk, lease expiry, duress counter / dead-man's wipe | KMS KATs pass; encrypted RAM-disk round-trip in QEMU; wrong-PIN counter destroys the vault (fail-closed) |
+| 75% | v0.7.0 | **Zero-ID identity** (Pillar 1): manifest schema (binary hash, sandbox profile, requested capabilities, lease terms), sandbox spawner, default grants, runtime prompt handshake | Spawner refuses hash mismatch; prompt grants session/lease-scoped caps, tracked by the Permission Tracker |
+| 100% | v0.8.0 | **IPC fast-path + Glass Wall** (Pillar 2/5): `syscall`/`sysret` ring transition, rendezvous register path, PCID/invpcid measured optimization, compositor read-only pixel buffers | Fast-path IPC under 100-cycle budget with disassembly evidence; compositor cannot read app memory (MMU-proven) |
 
-## Phase 3 — The Selective FHE Engine
+**v0.5.0 delivered (this push).** Kernel-side memory physics is real:
+the allocator classifies every frame (General/Locked/Shared/Reserved),
+freeing runs the wipe protocol before reuse, locked frames refuse the
+free path, and revocation is enforced by the MMU — a revoked capability
+produces a page fault, caught by the probe protocol and surfaced as a
+named denial. Bring-up lessons are recorded in the decision log
+(packed IDTR layout, identity addressing for pre-switch table setup,
+invlpg on current-root PTE changes).
+
+Formal specs added at v0.5.0: `proof/Mem.thy` (wipe-before-reuse,
+locked-never-reused, anti-swap closed-world I/O) and `proof/Revoke.thy`
+(revocation soundness: after the kill switch, no admitted access ever
+again; transfer pairing). Zero `sorry`.
+
+## Phase 3 — The Selective FHE Engine (next cycle)
 
 HCE service with background thread pool; C NTT/polynomial core behind FFI;
-integration with KMS. Milestone: private search over an encrypted dataset via
-background FHE threads without blocking the main thread.
+integration with KMS; the FHE Algorithmic Router (TFHE for boolean/control
+flow, BFV for exact integers, CKKS for approximate reals — data-typing,
+depth budgeting, thermal gating, arena pinning). Milestone: private search
+over an encrypted dataset via background FHE threads without blocking the
+main thread.
 
-## Phase 4 — The Glass Wall & Polish
+## Phase 4 — The Sovereign Network & Decentralized Fabric
 
-Compositor, capability shell, ZKP local auth, full Isabelle proof discharge.
-Milestone: v1.0 release — a verified, zero-ID, tiered-privacy OS.
+Dark Local Mesh (chameleon MACs, hashed overlay IPs, blind beacons, OOB
+trust handshake, local onion routing, capability-gated relaying) and the
+Decentralized Update Fabric (content-hash addressing over DHT/mirrors,
+Ed25519-signed manifests, reproducible-build verification, A/B atomic
+snapshot swap with instant rollback). Boot hardening lands here as well:
+Stage-1 kernel signature verification, duress PIN, dead-man's switch tied
+to the KMS, first-boot supply-chain audit.
+
+## Phase 5 — v1.0 Polish
+
+Full Isabelle proof discharge of the accumulated ledgers, Sovereignty
+Dashboard console, capability shell/REPL, final independent audit across
+all components.
 
 ## Formal verification plan
 

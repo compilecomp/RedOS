@@ -1,9 +1,9 @@
 [package]
 name = "redos-kernel"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2021"
 license = "AGPL-3.0"
-description = "RedOS verified microkernel — the blind TCB (Phase 1)"
+description = "RedOS verified microkernel — the blind TCB (Phase 2: memory physics)"
 
 # CEP&CC note: the kernel builds with ZERO third-party dependencies in
 # Phase 1. Every mechanism (serial driver, port I/O, panic path) is

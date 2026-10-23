@@ -27,7 +27,7 @@ else
 fi
 
 set +e
-timeout -k 5 150 "$QEMU_BIN" \
+timeout -k 5 240 "$QEMU_BIN" \
     -machine q35 -m 512M -display none -no-reboot -nic none -serial stdio \
     -L "${QEMU_DATA_DIR:-/usr/share/qemu}" \
     $PFLASH_ARGS \
@@ -41,9 +41,18 @@ if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
     exit 1
 fi
 
-if grep -q "REDOS IPC TEST PASS" "$LOG" && grep -q "REDOS IPC TAMPER PASS" "$LOG" && grep -q "REDOS-BOOT" "$LOG"; then
-    echo "BOOT TEST PASSED (serial banners verified)"
-    grep -E "REDOS-BOOT|RedOS|usable RAM|REDOS KERNEL" "$LOG" | head -12
+if grep -q "REDOS MEMPHY ISOLATION PASS" "$LOG" \
+   && grep -q "REDOS MEMPHY WIPE PASS" "$LOG" \
+   && grep -q "REDOS MEMPHY LOCK PASS" "$LOG" \
+   && grep -q "REDOS MEMPHY ZERO-COPY PASS" "$LOG" \
+   && grep -q "REDOS MEMPHY REVOKE PASS" "$LOG" \
+   && grep -q "REDOS MEMPHY TEST COMPLETE" "$LOG" \
+   && grep -q "REDOS-BOOT" "$LOG" \
+   && ! grep -q "FAIL:" "$LOG" \
+   && ! grep -q "KERNEL PANIC" "$LOG" \
+   && ! grep -q "KERNEL FAULT" "$LOG"; then
+    echo "BOOT TEST PASSED (memory-physics banners verified)"
+    grep -aE "REDOS-BOOT|RedOS|usable RAM|ephemeral|paging live|IDT live|MEMPHY" "$LOG" | head -16
     exit 0
 fi
 

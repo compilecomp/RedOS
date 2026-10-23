@@ -1,16 +1,23 @@
 //! RedOS kernel — tasks, context switch, cooperative scheduler.
 //!
-//! Phase 1 model (documented scope): tasks are ring-0 kernel threads with
-//! isolated stacks; scheduling is cooperative round-robin (tasks run until
-//! they block on IPC or exit). Preemptive zero-knowledge scheduling and
-//! user/ring-3 isolation arrive in Phase 2 with the APIC timer and the
-//! userspace runtime — the capability model does not depend on either.
+//! Phase 2 model (documented scope): tasks are ring-0 kernel threads with
+//! isolated stacks AND isolated address-space roots — each task carries a
+//! `cr3` physical root loaded at every switch (full TLB flush: the
+//! revocation-safe baseline, see mm/mod.rs). Private windows and
+//! per-task-permission shared windows live in these roots (mm/pagemap.rs).
+//! Preemptive scheduling and the ring-3 user/supervisor split arrive with
+//! the IPC fast-path milestone; the capability model does not depend on
+//! either.
 //!
-//! CEP: CEP-1 | Complete (Phase 1 scope; the switch path is CEP-0-candidate
-//!                   and will be measured+disassembled before Phase 2)
-//! Cost: switch_to is fixed ~15 instructions; scheduler_scan is O(MAX_TASKS).
-//! Fail: no-runnable-task and double-block conditions halt via panic (named).
-//! Assumes: x86_64 SysV; one CPU (no SMP in Phase 1); stacks are 16 KiB,
+//! CEP: CEP-0-candidate | Complete (Phase 2 scope)
+//! (The switch path keeps its CEP-0 candidacy: disassembly + cycle
+//! measurement deferred to the fast-path milestone, where the switch is
+//! rewritten with PCID — a measurement now would be thrown away.)
+//! Cost: switch_to is fixed ~15 instructions + one CR3 load; the scheduler
+//!       scan is O(MAX_TASKS).
+//! Fail: no-runnable-task and double-block conditions halt via panic
+//!       (named).
+//! Assumes: x86_64 SysV; one CPU (no SMP in Phase 2); stacks are 16 KiB,
 //!          allocated from the static pool below (no heap anywhere).
 
 use crate::serial;
@@ -73,6 +80,11 @@ pub struct Task {
     /// ipc_recv (otherwise a later mailbox message would be drained out of
     /// order — observed and fixed in v0.3.0 bring-up).
     pub delivered: bool,
+    /// Physical CR3 root for this task's address space (mm/pagemap.rs).
+    /// 0 = still running on the kernel root (the spawn default). Loaded at
+    /// every context switch; a full TLB flush accompanies each load (no
+    /// PCID in Phase 2 — the revocation-safe baseline).
+    pub cr3: u64,
     // Align the stack so the image top can satisfy the SysV 16-byte
     // convention (task entry must see rsp ≡ 8 (mod 16)).
     _align: [u64; 0],
@@ -105,6 +117,7 @@ const fn new_task() -> Task {
         recv_req: None,
         recv_len: 0,
         delivered: false,
+        cr3: 0,
         _align: [],
     }
 }
@@ -203,7 +216,13 @@ unsafe fn write_stack(addr: u64, val: u64) {
 }
 
 /// Switch to `next` from the current task, saving its context in `cur`.
+/// The target task's CR3 root is loaded BEFORE the stack switch (both
+/// contexts' code and the two Context structs live in the shared low
+/// identity map, so the CR3 load cannot strand us).
 /// CEP: CEP-1 | Complete
+/// Cost: one CR3 load (full TLB flush) + fixed ~15 instructions in the
+///       naked asm. Cycle measurement deferred to the fast-path milestone
+///       (where the switch path is rewritten with PCID anyway).
 /// Fail: cannot fail.
 /// Returns: when `cur` is later resumed by another switch back to it —
 /// the `ret` inside the naked asm lands back here, mid-call. That resume
@@ -211,6 +230,10 @@ unsafe fn write_stack(addr: u64, val: u64) {
 pub fn switch_to_task(cur: usize, next: usize) {
     debug_assert!(cur < MAX_TASKS && next < MAX_TASKS, "switch index OOB");
     let slots = tasks();
+    let root = slots[next].cr3;
+    if root != 0 && root != crate::mm::pagemap::current_cr3() {
+        crate::mm::pagemap::switch_cr3(root);
+    }
     unsafe {
         let old_ctx = &mut slots[cur].ctx as *mut Context;
         let new_ctx = &slots[next].ctx as *const Context;

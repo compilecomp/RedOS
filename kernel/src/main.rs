@@ -1,26 +1,50 @@
-//! RedOS kernel — entry point (Phase 1, push 3 of 4).
+//! RedOS kernel — entry point (Phase 2, milestone v0.5.0: Memory Physics).
 //!
-//! v0.3.0 scope: capability manager + blind IPC router + two kernel threads
-//! running the Phase 1 milestone: Task A encrypts a message with AES-256-GCM
-//! (C core), the kernel routes the ciphertext blindly, Task B decrypts and
-//! verifies it. Both a clean pass and a tamper-rejection path are exercised.
+//! The Phase-2 scenario implements Pillar 2 end to end with two kernel
+//! threads in isolated address spaces:
 //!
-//! CEP: CEP-1 | Complete (v0.3.0 scope)
+//!   Task A (producer, root_A)                    Task B (consumer, root_B)
+//!   -------------------------                    -------------------------
+//!   1. private page @ PRIV_BASE                  1. private page @ PRIV_ALT
+//!   2. probe B's page → #PF → denied             2. block on blind IPC recv
+//!   3. WIPE protocol test                        3. read ct via SHM keyhole
+//!   4. LOCK (mlock mandate) test                    decrypt → ZERO-COPY PASS
+//!   5. encrypt into SHM block                    4. kill switch: revoke cap
+//!      (kernel never touches bytes)                 + unmap → probe → #PF
+//!   6. transfer (A demoted to RO,                   → REVOKE PASS
+//!      B mapped RW, token minted)              5. REDOS MEMPHY TEST COMPLETE
+//!   7. send 24-byte descriptor (blind)
+//!   8. verify own write-demotion
+//!
+//! CI banners (asserted by scripts/boot_test.sh):
+//!   REDOS MEMPHY ISOLATION PASS   — cross-root probe denied by the MMU
+//!   REDOS MEMPHY WIPE PASS        — freed frame carries no residue
+//!   REDOS MEMPHY LOCK PASS        — locked frame refuses the free path
+//!   REDOS MEMPHY ZERO-COPY PASS   — payload moved by capability, not copy
+//!   REDOS MEMPHY REVOKE PASS      — post-revocation access is a #PF
+//!   REDOS MEMPHY TEST COMPLETE    — all six observed in one boot
+//!
+//! CEP: CEP-1 | Complete (Phase 2 scope)
 //! Cost: cold boot path + the two test tasks; all output via polled UART.
-//! Fail: panics (named, serial) on any handoff/IPC/crypto contract breach;
-//!       the test reports PASS/FAIL lines verbatim for the CI boot test.
+//! Fail: panics (named, serial) on any handoff/IPC/crypto/MMU contract
+//!       breach; FAIL lines (not panics) mark failed test assertions so
+//!       the CI log records them verbatim.
 //! Assumes: identity mapping + handoff from the Zig bootloader; interrupts
-//!          disabled; cooperative scheduling (see task.rs scope note).
+//!          disabled; cooperative scheduling; NO access to the handoff
+//!          struct after `pagemap::init()` switches CR3 (mm/pagemap.rs).
 
 #![no_std]
 #![no_main]
 #![deny(missing_docs)]
 
+mod audit;
 mod cap;
 mod ffi;
 mod handoff;
 mod ipc;
+mod mm;
 mod serial;
+mod shm;
 mod task;
 
 use cap::{CTable, RW};
@@ -28,16 +52,19 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use ffi::{gcm_decrypt, gcm_encrypt, IV_LEN, KEY_LEN, TAG_LEN};
-use handoff::{Handoff, MEM_RESERVED, MEM_USABLE};
+use handoff::Handoff;
 use ipc::IpcSendError;
+use mm::idt;
+use mm::pagemap::{self, hhdm, hhdm_mut, PRIV_ALT, PRIV_BASE, SHM_BASE};
+use mm::phys::{self, PageClass, PAGE_SIZE};
 
-/// Phase-1 test key. Phase 2 replaces this with the RAM-only KMS vault
-/// (Argon2id-derived, mlocked, wiped on power loss). Until then the key is
-/// a compile-time constant — acceptable ONLY because Phase 1 has no
+/// Phase-2 test key. v0.6.0 replaces this with the RAM-only KMS vault
+/// (Argon2id-derived, mlocked arena, duress-wiped). Until then the key is
+/// a compile-time constant — acceptable ONLY because Phase 2 has no
 /// persistent storage and no external interfaces (documented decision).
 const TEST_KEY: [u8; KEY_LEN] = [0x42; KEY_LEN];
 const TEST_IV: [u8; IV_LEN] = [0x07; IV_LEN];
-const PLAINTEXT: &[u8] = b"SOVEREIGN-HELLO-FROM-REDOS-PHASE1";
+const PLAINTEXT: &[u8] = b"SOVEREIGN-ZERO-COPY-FROM-REDOS-PHASE2";
 
 /// Task table indices assigned by kmain at spawn time. Atomics because the
 /// compiler must not assume aliasing freedom across the context-switch asm
@@ -45,16 +72,20 @@ const PLAINTEXT: &[u8] = b"SOVEREIGN-HELLO-FROM-REDOS-PHASE1";
 static TASK_A: AtomicUsize = AtomicUsize::new(0);
 static TASK_B: AtomicUsize = AtomicUsize::new(0);
 
-/// Per-task capability tables (minted by kmain, mutated only by kmain at
-/// spawn; tasks use them read-only — Phase 1 has no user-mode faults).
+/// Per-task capability tables (minted by kmain/transfer; tasks use them
+/// per the cooperative single-writer model).
 static mut TABLE_A: CTable = CTable::new();
 static mut TABLE_B: CTable = CTable::new();
 
 /// Endpoint index created by kmain (write-once; see TASK_A note).
 static EP: AtomicUsize = AtomicUsize::new(0);
-/// Capability slot indices minted per task (write-once).
+/// Endpoint capability slot per task (write-once).
 static CAP_A: AtomicUsize = AtomicUsize::new(0);
+/// Endpoint capability slot for task B (write-once).
 static CAP_B: AtomicUsize = AtomicUsize::new(0);
+/// Shared-memory capability slot minted into B by the transfer (written
+/// by A during transfer — cooperative model, see shm.rs).
+static SHM_SLOT_B: AtomicUsize = AtomicUsize::new(0);
 
 /// CEP: CEP-1 | Complete
 /// Cost: one-time boot path.
@@ -64,13 +95,25 @@ static CAP_B: AtomicUsize = AtomicUsize::new(0);
 pub extern "C" fn _start(boot: &Handoff) -> ! {
     serial::init();
 
-    serial::print(format_args!("\n=== RedOS v0.3.0 kernel ===\n"));
+    serial::print(format_args!("\n=== RedOS v0.5.0 kernel (Memory Physics) ===\n"));
 
     if let Err(reason) = boot.validate() {
         panic_str("handoff rejected: ", reason);
     }
     serial::print(format_args!("[boot] handoff OK (version {})\n", boot.version));
-    report_memory_map(boot);
+
+    // --- Memory physics bring-up (order matters) --------------------------
+    // 1. The ephemeral allocator reads the handoff memory map (last read
+    //    of boot-owned memory; everything after uses kernel-owned state).
+    phys::init(boot);
+    // 2. Paging: build the kernel root and switch CR3. From here on the
+    //    handoff/mmap pages are off-limits (documented in pagemap.rs).
+    pagemap::init();
+    // 3. The IDT (exception traps — the enforcement half of revocation).
+    idt::init();
+    // 4. Structural guarantees.
+    phys::anti_swap_audit();
+    phys::report();
 
     // Self-test the crypto core before trusting it with the milestone.
     if let Err(e) = crypto_selftest() {
@@ -78,7 +121,7 @@ pub extern "C" fn _start(boot: &Handoff) -> ! {
     }
     serial::print(format_args!("[boot] crypto core selftest OK\n"));
 
-    // --- Phase 1 milestone wiring -----------------------------------------
+    // --- Phase 2 milestone wiring -----------------------------------------
     let ep = ipc::create_endpoint();
     EP.store(ep, Ordering::Relaxed);
     let cap_a = table_a()
@@ -90,148 +133,309 @@ pub extern "C" fn _start(boot: &Handoff) -> ! {
     CAP_A.store(cap_a, Ordering::Relaxed);
     CAP_B.store(cap_b, Ordering::Relaxed);
     serial::print(format_args!(
-        "[boot] endpoint {} minted; caps A={} B={}\n",
+        "[boot] endpoint {} minted; endpoint caps A={} B={}\n",
         ep, cap_a, cap_b
     ));
 
-    // Spawn B first: it blocks on recv so the mailbox rendezvous is
-    // exercised deterministically (send-wake path, then block-wake path).
-    let b = task::spawn(echo_b, 0);
+    // Spawn B first: it builds its root, maps its private page, and blocks
+    // on recv — so A's cross-space probe and transfer are deterministic.
+    let b = task::spawn(memphy_b, 0);
     TASK_B.store(b, Ordering::Relaxed);
-    let a = task::spawn(echo_a, 0);
+    let a = task::spawn(memphy_a, 0);
     TASK_A.store(a, Ordering::Relaxed);
     serial::print(format_args!("[boot] tasks spawned: A={} B={}\n", a, b));
 
     task::scheduler_run()
 }
 
-/// Task A: encrypt two messages, send both through the blind router.
-/// Message 2 carries a flipped ciphertext bit to exercise the tamper path.
+// --- Task A: producer + memory-physics tests -------------------------------
+
+/// Task A: isolation probe, wipe/lock tests, zero-copy production, blind
+/// descriptor send, self write-demotion check.
 /// CEP: CEP-1 | Complete
-/// Fail: panics on any crypto/IPC contract breach (fail-fast).
-extern "C" fn echo_a(_arg: u64) -> ! {
+/// Cost: O(1) allocations + O(1) mappings + one GCM encrypt over 53 bytes
+///       + a 256-window wipe sweep (16×256 = 4 KiB of evidence reads).
+/// Fail: FAIL lines for assertion breaches (recorded by CI); panics on
+///       kernel-contract breaches (fail-fast).
+extern "C" fn memphy_a(_arg: u64) -> ! {
     let me = TASK_A.load(Ordering::Relaxed);
     let ep = EP.load(Ordering::Relaxed);
     let cap = CAP_A.load(Ordering::Relaxed);
 
-    // Message 1: clean ciphertext.
-    let ct1 = ct_buffer_a();
-    let mut tag1 = [0u8; TAG_LEN];
-    match gcm_encrypt(&TEST_KEY, &TEST_IV, PLAINTEXT, &[], ct1, &mut tag1) {
-        Ok(()) => {}
-        Err(e) => panic_str("A: encrypt m1: ", e),
+    // --- Root + private page ------------------------------------------------
+    let root_a = pagemap::new_task_root()
+        .unwrap_or_else(|e| panic_str("A: task root: ", e));
+    let priv_frame = phys::alloc(PageClass::General)
+        .unwrap_or_else(|| panic_str("A: ", "private frame exhausted"));
+    pagemap::map_page(root_a, PRIV_BASE, priv_frame, true)
+        .unwrap_or_else(|e| panic_str("A: map private: ", e));
+    // Pattern A's private page through the HHDM (kernel-side write).
+    let pv = hhdm_mut(priv_frame) as *mut u64;
+    for k in 0..(PAGE_SIZE / 8) {
+        unsafe { pv.add(k as usize).write_volatile(0xA5A5_5A5A_1234_5678) };
     }
-    let wire = wire_buffer_a();
-    let n1 = PLAINTEXT.len();
-    wire[..n1].copy_from_slice(&ct1[..n1]);
-    wire[n1..n1 + TAG_LEN].copy_from_slice(&tag1);
-    serial::print(format_args!("[A] sending {} ciphertext bytes\n", n1 + TAG_LEN));
+    tasks()[me].cr3 = root_a;
+    pagemap::switch_cr3(root_a);
+    serial::print(format_args!(
+        "[A] root {:#x} live; private page at {:#x}\n",
+        root_a, PRIV_BASE
+    ));
 
-    match ipc::ipc_send(me, table_a(), cap, ep, &wire[..n1 + TAG_LEN]) {
+    // --- ISOLATION: B's private page exists ONLY in B's root ----------------
+    // (B mapped it at PRIV_ALT before blocking; A's root has no PML4[14]
+    // entry for that slot — the probe MUST take a #PF.)
+    if idt::probe_read(PRIV_ALT).is_none() {
+        serial::print(format_args!(
+            "[A] cross-space probe at {:#x} denied by MMU\nREDOS MEMPHY ISOLATION PASS\n",
+            PRIV_ALT
+        ));
+    } else {
+        serial::print(format_args!(
+            "[A] FAIL: cross-space probe SUCCEEDED — address-space leak\n"
+        ));
+    }
+
+    // --- WIPE protocol: freed frames carry no residue ------------------------
+    let f = phys::alloc(PageClass::General)
+        .unwrap_or_else(|| panic_str("A: ", "wipe-test frame exhausted"));
+    let w = hhdm_mut(f) as *mut u64;
+    for k in 0..(PAGE_SIZE / 8) {
+        unsafe { w.add(k as usize).write_volatile(0xC7C7_C7C7_C7C7_C7C7) };
+    }
+    phys::free(f).unwrap_or_else(|_| panic_str("A: ", "free of General refused"));
+    // Statistical evidence: 256 independent 16-byte windows must not
+    // match the old pattern (a false PASS needs ≥2^-128 luck).
+    let mut residue = 0usize;
+    for k in 0..256usize {
+        let win = unsafe { core::slice::from_raw_parts(hhdm(f + (k as u64) * 16), 16) };
+        if win.iter().all(|&b| b == 0xC7) {
+            residue += 1;
+        }
+    }
+    if residue == 0 && phys::class_of(f) == PageClass::Free {
+        serial::print(format_args!(
+            "[A] freed frame wiped: 256/256 windows clean\nREDOS MEMPHY WIPE PASS\n"
+        ));
+    } else {
+        serial::print(format_args!(
+            "[A] FAIL: wipe protocol leaked {} window(s)\n",
+            residue
+        ));
+    }
+
+    // --- LOCK: the mlock mandate refuses the free path -----------------------
+    let lk = phys::alloc(PageClass::Locked)
+        .unwrap_or_else(|| panic_str("A: ", "locked frame exhausted"));
+    let lock_refused = phys::free(lk).is_err();
+    let lock_class = phys::class_of(lk);
+    if lock_refused && lock_class == PageClass::Locked {
+        serial::print(format_args!(
+            "[A] locked frame {:#x} refuses free (mlock mandate)\nREDOS MEMPHY LOCK PASS\n",
+            lk
+        ));
+    } else {
+        serial::print(format_args!(
+            "[A] FAIL: locked frame was freed or reclassified\n"
+        ));
+    }
+
+    // --- Zero-copy production: encrypt INTO the shared block ------------------
+    let block = shm::create(shm::BLOCK_PAGES)
+        .unwrap_or_else(|e| panic_str("A: shm create: ", e));
+    shm::map_for(root_a, block, true)
+        .unwrap_or_else(|e| panic_str("A: shm map: ", e));
+    let phys_disp = match shm::phys_of(block) {
+        Ok(p) => p,
+        Err(e) => {
+            serial::print(format_args!("[A] FAIL: phys_of: {}\n", e));
+            task::task_exit(me);
+        }
+    };
+    serial::print(format_args!(
+        "[A] shm block {} at vaddr {:#x} (phys {:#x})\n",
+        block,
+        shm::vaddr_of(block),
+        phys_disp
+    ));
+
+    let n = PLAINTEXT.len();
+    // The ciphertext lands DIRECTLY in the shared block through A's own
+    // keyhole — the kernel copies nothing (blindness + zero-copy).
+    let shm_ptr = SHM_BASE as *mut u8;
+    let ct = unsafe { core::slice::from_raw_parts_mut(shm_ptr, n) };
+    let tag_ptr = unsafe { shm_ptr.add(n) } as *mut [u8; TAG_LEN];
+    let tag = unsafe { &mut *tag_ptr };
+    if let Err(e) = gcm_encrypt(&TEST_KEY, &TEST_IV, PLAINTEXT, &[], ct, tag) {
+        panic_str("A: encrypt into shm: ", e);
+    }
+    serial::print(format_args!(
+        "[A] wrote {} ct + {} tag bytes into shared block via own mapping\n",
+        n,
+        TAG_LEN
+    ));
+
+    // --- Transfer: A demoted to RO, B mapped RW, token minted -----------------
+    let b = TASK_B.load(Ordering::Relaxed);
+    let root_b = tasks()[b].cr3;
+    let slot_b = shm::transfer(block, root_a, root_b, table_b())
+        .unwrap_or_else(|e| panic_str("A: shm transfer: ", e));
+    SHM_SLOT_B.store(slot_b, Ordering::Relaxed);
+    serial::print(format_args!(
+        "[A] transfer complete: B cap slot {} (token minted)\n",
+        slot_b
+    ));
+
+    // Write-demotion check: A's own window must now deny writes (the
+    // "Read-Only" half of the dual-keyhole handoff).
+    if !idt::probe_write(SHM_BASE, 0xFFFF_1111_2222_3333) {
+        serial::print(format_args!(
+            "[A] post-transfer write denied (write-demotion enforced)\n"
+        ));
+    } else {
+        serial::print(format_args!("[A] FAIL: post-transfer write SUCCEEDED\n"));
+    }
+
+    // --- Blind descriptor send (24 bytes: the router sees none of it) --------
+    let desc: [u8; 24] = {
+        let mut d = [0u8; 24];
+        d[0..8].copy_from_slice(&(block as u64).to_le_bytes());
+        d[8..16].copy_from_slice(&0u64.to_le_bytes()); // offset
+        d[16..24].copy_from_slice(&(n as u64).to_le_bytes()); // length
+        d
+    };
+    match ipc::ipc_send(me, table_a(), cap, ep, &desc) {
         Ok(()) => {}
         Err(IpcSendError::Block) => task::schedule_from(me),
-        Err(IpcSendError::Contract(e)) => panic_str("A: send m1: ", e),
-    }
-
-    // Message 2: single flipped bit in the ciphertext (tag now invalid).
-    let ct2 = ct_buffer_a2();
-    let mut tag2 = [0u8; TAG_LEN];
-    if let Err(e) = gcm_encrypt(&TEST_KEY, &TEST_IV, PLAINTEXT, &[], ct2, &mut tag2) {
-        panic_str("A: encrypt m2: ", e);
-    }
-    ct2[3] ^= 0x10;
-    wire[..n1].copy_from_slice(&ct2[..n1]);
-    wire[n1..n1 + TAG_LEN].copy_from_slice(&tag2);
-    serial::print(format_args!("[A] sending tampered message\n"));
-
-    match ipc::ipc_send(me, table_a(), cap, ep, &wire[..n1 + TAG_LEN]) {
-        Ok(()) => {}
-        Err(IpcSendError::Block) => task::schedule_from(me),
-        Err(IpcSendError::Contract(e)) => panic_str("A: send m2: ", e),
+        Err(IpcSendError::Contract(e)) => panic_str("A: send desc: ", e),
     }
 
     serial::print(format_args!("[A] done\n"));
     task::task_exit(me)
 }
 
-/// Task B: receive both messages; verify clean pass + tamper rejection.
+// --- Task B: consumer + revocation kill-switch test -------------------------
+
+/// Task B: private page (mapped BEFORE A probes), blind recv, zero-copy
+/// consumption, kill-switch revocation.
 /// CEP: CEP-1 | Complete
-/// Fail: FAIL lines (not panic) so the CI log records the failed assertion.
-extern "C" fn echo_b(_arg: u64) -> ! {
+/// Cost: O(1) allocations + O(1) mappings + one GCM decrypt over 53 bytes
+///       + two probes.
+/// Fail: FAIL lines for assertion breaches (recorded by CI); panics on
+///       kernel-contract breaches (fail-fast).
+extern "C" fn memphy_b(_arg: u64) -> ! {
     let me = TASK_B.load(Ordering::Relaxed);
+
+    // --- Root + B-only private page (A will probe this and MUST fault) -----
+    let root_b = pagemap::new_task_root()
+        .unwrap_or_else(|e| panic_str("B: task root: ", e));
+    let priv_frame = phys::alloc(PageClass::General)
+        .unwrap_or_else(|| panic_str("B: ", "private frame exhausted"));
+    pagemap::map_page(root_b, PRIV_ALT, priv_frame, true)
+        .unwrap_or_else(|e| panic_str("B: map private: ", e));
+    let pv = hhdm_mut(priv_frame) as *mut u64;
+    for k in 0..(PAGE_SIZE / 8) {
+        unsafe { pv.add(k as usize).write_volatile(0xB0B5_C0DE_BEEF_BABE) };
+    }
+    tasks()[me].cr3 = root_b;
+    pagemap::switch_cr3(root_b);
+    serial::print(format_args!(
+        "[B] root {:#x} live; private page at {:#x}\n",
+        root_b, PRIV_ALT
+    ));
+
+    // --- Blind recv of the descriptor ---------------------------------------
     let ep = EP.load(Ordering::Relaxed);
     let cap = CAP_B.load(Ordering::Relaxed);
-    let n = PLAINTEXT.len();
-
-    // --- Message 1: must authenticate and round-trip -----------------------
-    let mut buf = recv_buffer_b();
+    let mut buf = [0u8; 24];
     let got = match ipc_recv_blocking(me, cap, ep, &mut buf) {
         Some(g) => g,
         None => task::task_exit(me),
     };
-    if got != n + TAG_LEN {
+    if got != 24 {
+        serial::print(format_args!("[B] FAIL: descriptor {} bytes, want 24\n", got));
+        task::task_exit(me);
+    }
+    let block = u64::from_le_bytes(buf[0..8].try_into().unwrap()) as usize;
+    let len = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
+    serial::print(format_args!(
+        "[B] descriptor: block={} len={} (router never inspected these)\n",
+        block, len
+    ));
+
+    // --- Zero-copy consumption via B's keyhole ------------------------------
+    let slot = SHM_SLOT_B.load(Ordering::Relaxed);
+    let rights = table_b()
+        .lookup_shm(slot, block)
+        .unwrap_or_else(|e| panic_str("B: shm cap: ", e));
+    serial::print(format_args!(
+        "[B] shm cap slot {}: rights={:#x} (READ|WRITE)\n",
+        slot, rights
+    ));
+
+    let n = PLAINTEXT.len();
+    if len != n {
         serial::print(format_args!(
-            "[B] FAIL: got {} bytes, want {}\n",
-            got,
-            n + TAG_LEN
+            "[B] FAIL: descriptor len {} != expected {}\n",
+            len, n
         ));
         task::task_exit(me);
     }
-    let mut tag = [0u8; TAG_LEN];
-    tag.copy_from_slice(&buf[n..n + TAG_LEN]);
-    let mut pt = [0u8; ipc::MAX_MSG];
-    match gcm_decrypt(&TEST_KEY, &TEST_IV, &buf[..n], &[], &mut tag, &mut pt[..n]) {
+    let shm_ptr = SHM_BASE as *const u8;
+    let ct = unsafe { core::slice::from_raw_parts(shm_ptr, n) };
+    let tag = unsafe { core::slice::from_raw_parts(shm_ptr.add(n), TAG_LEN) };
+    let mut tag_copy = [0u8; TAG_LEN];
+    tag_copy.copy_from_slice(tag);
+    let mut pt = [0xEEu8; 64];
+    match gcm_decrypt(&TEST_KEY, &TEST_IV, ct, &[], &tag_copy, &mut pt[..n]) {
         Ok(()) => {
             if &pt[..n] == PLAINTEXT {
                 serial::print(format_args!(
-                    "[B] decrypted: {}\n",
-                    core::str::from_utf8(&pt[..n]).unwrap_or("<invalid utf8>")
+                    "[B] decrypted via shared mapping: {}\n",
+                    core::str::from_utf8(&pt[..n]).unwrap_or("<invalid>")
                 ));
-                serial::print(format_args!("REDOS IPC TEST PASS\n"));
+                serial::print(format_args!("REDOS MEMPHY ZERO-COPY PASS\n"));
             } else {
                 serial::print(format_args!("[B] FAIL: plaintext mismatch\n"));
             }
         }
-        Err(e) => serial::print(format_args!("[B] FAIL: clean message rejected: {}\n", e)),
+        Err(e) => serial::print(format_args!("[B] FAIL: decrypt: {}\n", e)),
     }
 
-    // --- Message 2: tampered ciphertext must be rejected, buffer zeroed ----
-    let got2 = match ipc_recv_blocking(me, cap, ep, &mut buf) {
-        Some(g) => g,
-        None => task::task_exit(me),
-    };
-    if got2 < n + TAG_LEN {
-        serial::print(format_args!("[B] FAIL: short message {} bytes\n", got2));
-        task::task_exit(me);
+    // --- KILL SWITCH: revoke cap + unmap; next access must #PF ---------------
+    let root_now = tasks()[me].cr3;
+    match shm::revoke(root_now, table_b(), slot, block) {
+        Ok(()) => {}
+        Err(e) => panic_str("B: revoke: ", e),
     }
-    let mut tag3 = [0u8; TAG_LEN];
-    tag3.copy_from_slice(&buf[n..got2]);
-    let mut pt2 = [0xEEu8; ipc::MAX_MSG];
-    match gcm_decrypt(&TEST_KEY, &TEST_IV, &buf[..n], &[], &tag3, &mut pt2[..n]) {
-        Err("AUTH") => {
-            let zeroed = pt2[..n].iter().all(|&b| b == 0);
-            if zeroed {
-                serial::print(format_args!(
-                    "[B] tamper rejected, buffer zeroed\nREDOS IPC TAMPER PASS\n"
-                ));
-            } else {
-                serial::print(format_args!("[B] FAIL: tamper path did not zero buffer\n"));
-            }
-        }
-        Ok(()) => serial::print(format_args!("[B] FAIL: tampered message accepted\n")),
-        Err(e) => serial::print(format_args!("[B] FAIL: unexpected error {}\n", e)),
+    serial::print(format_args!(
+        "[B] kill switch: cap slot zeroed + PTE torn down\n"
+    ));
+    if idt::probe_read(SHM_BASE).is_none() {
+        serial::print(format_args!(
+            "[B] post-revocation access trapped by MMU\nREDOS MEMPHY REVOKE PASS\n"
+        ));
+    } else {
+        serial::print(format_args!(
+            "[B] FAIL: post-revocation access SUCCEEDED — revocation leak\n"
+        ));
     }
 
-    serial::print(format_args!("[B] done\n"));
+    // Sanity: B's own private page still mapped and intact.
+    let pv = unsafe { (PRIV_ALT as *const u64).read_volatile() };
+    if pv == 0xB0B5_C0DE_BEEF_BABE {
+        serial::print(format_args!("[B] private page intact after revoke (scope OK)\n"));
+    } else {
+        serial::print(format_args!("[B] FAIL: private page disturbed ({:#x})\n", pv));
+    }
+
+    serial::print(format_args!("[B] done\nREDOS MEMPHY TEST COMPLETE\n"));
     task::task_exit(me)
 }
 
 /// ipc_recv wrapper that yields while the router has the task blocked.
 /// CEP: CEP-1 | Complete
+/// Cost: O(1) per poll; O(yields) until delivery (cooperative wake).
 /// Fail: None on contract error (printed here, named, caller exits).
-/// The scratch buffer is MAX_MSG + TAG_LEN so a wire message (ciphertext ||
-/// tag, both within one MAX_MSG message) never truncates; the router
-/// contract caps a single receive at MAX_MSG, so we pass the cap.
 fn ipc_recv_blocking(me: usize, cap: usize, ep: usize, buf: &mut [u8]) -> Option<usize> {
     let recv_cap = buf.len().min(ipc::MAX_MSG);
     loop {
@@ -259,30 +463,8 @@ fn ipc_recv_blocking(me: usize, cap: usize, ep: usize, buf: &mut [u8]) -> Option
     }
 }
 
-// Scratch buffers (statics, not stack — the messages are 4 KiB-class and
-// Phase 1 stacks are 16 KiB; keeping large buffers out of stacks is an
-// explicit stack-budget decision, not an accident).
-static mut CT_A: [u8; ipc::MAX_MSG] = [0; ipc::MAX_MSG];
-static mut CT_A2: [u8; ipc::MAX_MSG] = [0; ipc::MAX_MSG];
-static mut WIRE_A: [u8; ipc::MAX_MSG + TAG_LEN] = [0; ipc::MAX_MSG + TAG_LEN];
-static mut RECV_B: [u8; ipc::MAX_MSG + TAG_LEN] = [0; ipc::MAX_MSG + TAG_LEN];
+// Scratch buffers and accessors (statics, not stacks — stack budget).
 
-#[allow(static_mut_refs)]
-fn ct_buffer_a() -> &'static mut [u8] {
-    unsafe { &mut *core::ptr::addr_of_mut!(CT_A) }
-}
-#[allow(static_mut_refs)]
-fn ct_buffer_a2() -> &'static mut [u8] {
-    unsafe { &mut *core::ptr::addr_of_mut!(CT_A2) }
-}
-#[allow(static_mut_refs)]
-fn wire_buffer_a() -> &'static mut [u8] {
-    unsafe { &mut *core::ptr::addr_of_mut!(WIRE_A) }
-}
-#[allow(static_mut_refs)]
-fn recv_buffer_b() -> &'static mut [u8] {
-    unsafe { &mut *core::ptr::addr_of_mut!(RECV_B) }
-}
 #[allow(static_mut_refs)]
 fn table_a() -> &'static mut CTable {
     unsafe { &mut *core::ptr::addr_of_mut!(TABLE_A) }
@@ -290,6 +472,10 @@ fn table_a() -> &'static mut CTable {
 #[allow(static_mut_refs)]
 fn table_b() -> &'static mut CTable {
     unsafe { &mut *core::ptr::addr_of_mut!(TABLE_B) }
+}
+#[allow(static_mut_refs)]
+fn tasks() -> &'static mut [task::Task; task::MAX_TASKS] {
+    task::tasks()
 }
 
 /// One-block encrypt/decrypt round trip against the C core.
@@ -305,36 +491,6 @@ fn crypto_selftest() -> Result<(), &'static str> {
         return Err("round-trip mismatch");
     }
     Ok(())
-}
-
-/// CEP: CEP-2 | Complete (cold diagnostic; explicit formatting cost)
-/// Cost: O(mmap_len) with one formatted line per region (bounded 256).
-fn report_memory_map(boot: &Handoff) {
-    let mut usable_total: u64 = 0;
-    let mut usable_regions: u64 = 0;
-
-    for e in boot.mem_entries() {
-        let kind = match e.kind {
-            MEM_USABLE => "usable",
-            MEM_RESERVED => "reserved",
-            _ => "unknown",
-        };
-        serial::print(format_args!(
-            "  {:#018x}-{:#018x} {}\n",
-            e.base,
-            e.base.saturating_add(e.len),
-            kind
-        ));
-        if e.kind == MEM_USABLE {
-            usable_total = usable_total.saturating_add(e.len);
-            usable_regions += 1;
-        }
-    }
-    serial::print(format_args!(
-        "[boot] usable RAM: {} KiB in {} region(s)\n",
-        usable_total / 1024,
-        usable_regions
-    ));
 }
 
 /// CEP: CEP-1 | Complete

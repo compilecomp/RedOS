@@ -50,6 +50,7 @@ QEMU + OVMF + mtools for boot tests (added with the v0.2.0 milestone).
 | v0.2.0  | Zig UEFI bootloader + Rust kernel boots to serial in QEMU          | boot ✓    |
 | v0.3.0  | Capability manager + blind IPC + encrypted echo test (Phase 1 MS)  | ipc ✓     |
 | v0.4.0  | Isabelle specs (cap algebra, blind IPC), full CI, Phase 1 closure  | proof ✓   |
+| v0.5.0  | Memory physics: paging, ephemeral allocator, wipe protocol, zero-copy SHM + MMU-enforced revocation (Phase 2 open) | memphy ✓  |
 
 ## License & standards
 

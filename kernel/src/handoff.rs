@@ -25,6 +25,7 @@ pub const HANDOFF_VERSION: u64 = 1;
 
 /// Memory region classification (normalized from UEFI memory types).
 pub const MEM_USABLE: u64 = 1;
+#[allow(dead_code)] // ABI constant: defined by the bootloader contract (main.zig)
 pub const MEM_RESERVED: u64 = 2;
 
 /// One entry of the boot memory map, normalized from the UEFI memory map.

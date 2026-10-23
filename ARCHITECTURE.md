@@ -39,11 +39,33 @@ The coding standard is CEP&CC 0.1 (`standard.md` at repository root).
   user, no global admin. Capability rights: SEND/RECV/GRANT per endpoint.
 - **Blind IPC router**: checks message size and destination capability, copies
   payloads without inspection. Payloads are ciphertext by convention.
-- **Zero-knowledge scheduler**: allocates CPU slices by priority, agnostic to
-  data content. Preemptive round-robin in Phase 1.
-- **Memory guard**: pages tagged "key material" are pinned (never swapped) —
-  enforced once a swap path exists (Phase 2+); swapping is absent by design
-  before that.
+- **Zero-knowledge scheduler**: cooperative round-robin (Phase 1); per-task
+  CR3 address-space roots since v0.5.0 (full TLB flush on switch — the
+  revocation-safe baseline; PCID arrives with the fast-path milestone).
+- **Memory physics (v0.5.0, real)**:
+  - *Ephemeral Page Allocator* (`mm/phys.rs`): every frame carries a class
+    (General / Locked / Shared / Reserved). Freeing runs the wipe protocol
+    (address-mixed noise, then zero) BEFORE the frame re-enters the pool;
+    double frees are named errors. Locked frames (Key Material / FHE State)
+    refuse the free path — only the KMS owner may zero them (v0.6.0). The
+    anti-swap guarantee is structural: no block-device driver is linked;
+    `anti_swap_audit()` verifies the DECLARED external surface
+    (audit.rs, reviewed every push) stays free of storage-path names.
+  - *Paging* (`mm/pagemap.rs`): 4-level tables, 512 MiB low identity map,
+    HHDM at 0xFFFF_8000_0000_0000, per-task windows for zero-copy shared
+    memory (PML4[192]) and private pages (PML4[224]). All served frames are
+    below the 512 MiB service ceiling and identity-mapped in every root —
+    the allocator and table builder never depend on which CR3 is loaded.
+  - *IDT + probe protocol* (`mm/idt.rs`): #PF handler with a fixup-based
+    safe-probe (read/write). Revocation is enforced by the MMU: a revoked
+    mapping produces a #PF, which the handler turns into a named
+    "Access Denied" — never a panic, never a silent pass. Unexpected faults
+    halt with forensics (CR2/error-code decode).
+  - *Zero-copy SHM* (`shm.rs`): transfer demotes the sender's mapping to
+    read-only (write-demotion on send), maps the receiver read-write, and
+    mints the receiver's capability token — the kernel copies a 24-byte
+    descriptor, never the payload. `revoke()` zeroes the CNode slot AND
+    tears down the PTEs (with `invlpg` when the affected root is loaded).
 
 ### Layer 2 — Userspace runtime & crypto engines — Rust + C
 - **Capability-aware libc**: minimal, `no_std`-compatible core (Phase 2).
@@ -82,7 +104,11 @@ manager (Phase 4).
 | IPC payload policy | Kernel never inspects | Blind routing is a spec-level property |
 | Phase-1 crypto | AES-256-GCM (C core, NIST-vector-tested) | Tier-1 path; FHE arrives in Phase 3 |
 | Formal specs | Isabelle/HOL, real on day 1 | Capability algebra + IPC abstraction; v0.4.0 sessions build `sorry`-free (ledger: proof/TODO.md) |
-| Git protocol | main + annotated tags at each 25% milestone | Reviewable quarterly pushes |
+| Phase-2 paging baseline | No PCID, full TLB flush per CR3 load | A stale TLB entry can never outlive a revocation; the fast-path milestone adds ASIDs as a measured optimization |
+| Frame addressing | Identity (≤ 512 MiB service ceiling) for allocator + table builder | Works under any active CR3 — the HHDM does not exist until the kernel switches (v0.5.0 bring-up lesson) |
+| IDTR layout | `repr(C, packed(1))` — limit@0, base@2 | The hardware IDTR is packed; a padded struct loads garbage (v0.5.0 bring-up lesson, caught by the sidt readback assertion) |
+| PTE coherence | `invlpg` after flag-change/unmap on the CURRENT root | Without it the CPU serves stale RW/live translations (v0.5.0 bring-up lesson) |
+| Git protocol | main + annotated tags at each 25% milestone | Reviewable quarterly pushes; scope widened by user directive (no LOC ceiling) |
 
 ## LOC ledger (targets from the approved blueprint)
 
