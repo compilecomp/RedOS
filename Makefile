@@ -13,12 +13,14 @@ UNAME_M := $(shell uname -m)
 
 # Host build flags (CEP&CC 6.3: warnings are errors)
 HOST_CFLAGS  := -std=c11 -O2 -Wall -Wextra -Werror -pedantic \
+                -fcf-protection=none \
 	        -Icrypto/include
 
 # Kernel-grade freestanding flags. The -mno-* set is x86_64-specific
 # (CEP&CC Law 7: target-dependent flags live in exactly one place).
 FREE_CFLAGS  := -std=c11 -O2 -Wall -Wextra -Werror -pedantic \
 	        -ffreestanding -fno-builtin -fno-stack-protector \
+		-fcf-protection=none \
 	        -Icrypto/include
 ifeq ($(UNAME_M),x86_64)
 FREE_CFLAGS += -mno-red-zone -mno-mmx -mno-sse -mno-sse2
