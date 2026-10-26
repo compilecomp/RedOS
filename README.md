@@ -21,6 +21,11 @@ Status: **Phase 2 — The RAM-Only Vault & Memory Physics** (see [docs/ROADMAP.m
    has no stored verifier — PIN correctness IS the GCM tag), counts
    wrong-PIN attempts in every live state, and destroys itself at budget
    (duress dead-man wipe, terminal `Dead`, all I/O fails closed).
+   v0.7.0 removes the last secret constant: the PIN is typed through the
+   input service at boot (masked echo; the kernel binary carries no PIN
+   — `make secret-audit` proves it), and a compile-time RNG policy can
+   refuse to generate a master key from anything but hardware RDRAND
+   (terminal `Refused` state).
 4. **Minimal verified TCB** — the kernel is mechanism-only, target 8,000–12,000 LOC
    (hard cap 15,000), with Isabelle/HOL specifications in `proof/`.
 
@@ -57,6 +62,17 @@ QEMU + OVMF + mtools for boot tests (added with the v0.2.0 milestone).
 | v0.4.0  | Isabelle specs (cap algebra, blind IPC), full CI, Phase 1 closure  | proof ✓   |
 | v0.5.0  | Memory physics: paging, ephemeral allocator, wipe protocol, zero-copy SHM + MMU-enforced revocation (Phase 2 open) | memphy ✓  |
 | v0.6.0  | RAM-only KMS vault: BLAKE2b + Argon2id (RFC 9106 KAT) + XTS-AES-256 (IEEE 1619 KAT), sealed-blob PIN unlock in Locked frames, wrong-PIN dead-man wipe, tick leases, XTS RAM disk | kms ✓     |
+| v0.7.0  | Zero-ID identity: MAC'd manifest schema (content-hash bound), sandbox spawner (fresh root + RO code window), default-deny grants, operator prompt handshake, append-only Permission Tracker, input service (no PIN constants), strict-RNG policy; REPAIRS two latent CI failures carried since v0.4/v0.5 (see note) | idnt ✓    |
+
+**CI honesty note (v0.7.0).** The ✓ marks above are v0.7.0's local-plus-CI
+status. The v0.3.0–v0.6.0 pushes shipped while CI was in fact red — the
+proof job died downloading Isabelle (one hanging mirror consumed the job
+timeout; now fast-fail bounded per mirror, four mirrors) and the boot job
+died on firmware maps larger than the bootloader's 128-entry table (now
+coalesced into maximal same-kind regions with a 256-entry contract bound
+matching the kernel's handoff validation). Both were invisible locally
+(sandbox QEMU emits exactly 123 entries) and surfaced only through the
+v0.7.0 review gate — recorded here so the ledger stays honest.
 
 ## License & standards
 

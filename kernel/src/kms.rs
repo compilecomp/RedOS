@@ -98,12 +98,20 @@ enum VaultState {
     Wiping,
     /// Terminal. No operation ever succeeds again (proof: Dead terminal).
     Dead,
+    /// v0.7.0 strict-RNG refusal: the configured entropy policy refuses
+    /// the available entropy source, so NO master key was ever generated.
+    /// Terminal like Dead (fail-closed: a vault that cannot be seeded
+    /// honestly must not pretend to run), but status() distinguishes it.
+    Refused,
 }
 
-/// A leased derived key with a scheduler-tick expiry.
+/// A leased derived key with a scheduler-tick expiry, bound to its owner
+/// task (v0.7.0: lease theft refuses with NoSuchLease — a non-owner's
+/// view of the lease is indistinguishable from its absence).
 #[derive(Clone, Copy)]
 struct Lease {
     in_use: bool,
+    owner: usize,
     key: [u8; MASTER_KEY_LEN],
     expires_tick: u64,
 }
@@ -112,6 +120,7 @@ impl Lease {
     const fn new() -> Lease {
         Lease {
             in_use: false,
+            owner: usize::MAX,
             key: [0; MASTER_KEY_LEN],
             expires_tick: 0,
         }
@@ -135,6 +144,22 @@ static mut SALT: [u8; 16] = [0; 16];
 static mut LEASES: [Lease; MAX_LEASES] = [Lease::new(); MAX_LEASES];
 /// Next lease id (monotone; feeds the derivation domain separation).
 static mut LEASE_SEQ: u64 = 0;
+/// Entropy-policy switch (v0.7.0): Lenient admits the documented weak
+/// TSC fallback with a loud report (QEMU CI's TCG CPU has no RDRAND);
+/// Strict refuses to generate a master key from anything but RDRAND.
+/// Production builds set Strict (main.rs const), CI runs Lenient.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RngPolicy {
+    /// Weak fallback allowed (reported as WEAK in the boot log).
+    Lenient,
+    /// RDRAND or no key (vault enters the terminal Refused state).
+    Strict,
+}
+static mut RNG_POLICY: RngPolicy = RngPolicy::Lenient;
+/// The entropy source actually used at seal time ("rdrand" or
+/// "tsc-fallback(WEAK)"); "none" before init. Surfaced for the
+/// RNG-policy banner and the strict-refusal evidence.
+static mut ENTROPY_SRC: &str = "none";
 
 // --- Errors -----------------------------------------------------------------
 
@@ -143,6 +168,9 @@ static mut LEASE_SEQ: u64 = 0;
 pub enum UnlockError {
     /// Vault is destroyed (duress) — terminal, fail-closed.
     Dead,
+    /// Strict RNG policy refused the seal — no master key exists to
+    /// unlock (v0.7.0; terminal like Dead).
+    Refused,
     /// Already unlocked; the sealed blob is not re-unlocked.
     AlreadyUnlocked,
     /// Tag authentication failed. `remaining` = attempts left before
@@ -158,9 +186,12 @@ pub enum UnlockError {
 pub enum KmsError {
     /// Terminal state (duress wiped the vault).
     Dead,
+    /// Terminal state (strict-RNG refusal — no key ever existed).
+    Refused,
     /// Vault not unlocked.
     Sealed,
-    /// Lease id unknown.
+    /// Lease id unknown — OR owned by another task (v0.7.0: the two are
+    /// deliberately indistinguishable to a non-owner; see lease_use).
     NoSuchLease,
     /// Lease expired: the key was zeroized on this access (lazy expiry).
     Expired,
@@ -265,14 +296,57 @@ fn master_key_entropy() -> ([u8; MASTER_KEY_LEN], &'static str) {
 
 // --- Boot-time init ---------------------------------------------------------
 
+/// Configure the entropy policy. Call before `init` (kmain does, from a
+/// compile-time policy constant — see main.rs RNG_POLICY and its honesty
+/// note about production builds).
+/// CEP: CEP-1 | Complete
+/// Cost: one store.
+/// Fail: cannot fail.
+pub fn set_rng_policy(p: RngPolicy) {
+    unsafe { RNG_POLICY = p };
+}
+
+/// The configured entropy policy (for banners/audit).
+/// CEP: CEP-1 | Complete
+/// Cost: one load.
+/// Fail: cannot fail.
+pub fn rng_policy() -> RngPolicy {
+    unsafe { RNG_POLICY }
+}
+
+/// THE RNG decision function (pure; proof/Kms.thy `rng_admits` twin).
+/// Strict builds admit only hardware RDRAND; Lenient admits everything
+/// but the caller must surface the source honestly in the log.
+/// CEP: CEP-1 | Complete
+/// Cost: O(1).
+/// Fail: cannot fail (returns the decision, never panics).
+pub fn rng_admits(policy: RngPolicy, source: &str) -> bool {
+    match policy {
+        RngPolicy::Lenient => true,
+        RngPolicy::Strict => source == "rdrand",
+    }
+}
+
+/// The entropy source used at seal time ("rdrand", "tsc-fallback(WEAK)",
+/// or "none" before init). Evidence channel for the RNG-policy banner.
+/// CEP: CEP-1 | Complete
+/// Cost: one load.
+/// Fail: cannot fail.
+pub fn last_entropy_source() -> &'static str {
+    unsafe { ENTROPY_SRC }
+}
+
 /// Allocate the vault's Locked memory and seal a fresh master key under
-/// the PIN-derived KEK. The PIN at boot time is the TEST PIN (the input
-/// service that takes real PINs arrives in v0.7.0 — documented).
+/// the PIN-derived KEK. The PIN arrives through the input service (v0.7.0:
+/// no PIN constant exists in the kernel binary — the CI feeder types it
+/// over the UART; on hardware the operator does).
 ///
 /// CEP: CEP-1 | Complete
 /// Cost: O(arena frames) alloc + zero-on-grant; one Argon2id + one GCM.
 /// Fail: panics on frame exhaustion or crypto contract breach (a vault
-///       that cannot seal must not boot pretending it did).
+///       that cannot seal must not boot pretending it did). Strict policy
+///       + non-RDRAND entropy enters the terminal Refused state instead:
+///       no key is generated, nothing to unlock, everything fails closed.
 /// Assumes: called once, after phys::init, before any task runs.
 pub fn init(pin: &[u8]) {
     unsafe {
@@ -297,8 +371,26 @@ pub fn init(pin: &[u8]) {
         SALT[..8].copy_from_slice(&HW_SALT_CONST);
         SALT[8..].copy_from_slice(&(((hi as u64) << 32) | lo as u64).to_le_bytes());
 
-        // --- fresh master key -> sealed blob -------------------------------
-        let (master, src) = master_key_entropy();
+        // --- fresh master key -> entropy policy gate (v0.7.0) --------------
+        let (mut master, src) = master_key_entropy();
+        ENTROPY_SRC = src;
+        if !rng_admits(rng_policy(), src) {
+            // Strict refusal: destroy the freshly drawn key (IN PLACE —
+            // the stack slot itself, not a copy), zero the sealed-blob
+            // frame, and enter the terminal Refused state. No KEK
+            // derivation runs (the PIN is never even read into the
+            // vault's control flow), no blob is written, no key exists.
+            wipe_bytes(&mut master);
+            owner_zero_frame(BLOB_FRAME);
+            STATE = VaultState::Refused;
+            serial::print(format_args!(
+                "[kms] STRICT RNG POLICY: entropy source '{}' is not RDRAND — refusing to generate a master key (vault REFUSED, terminal)\n",
+                src
+            ));
+            return;
+        }
+
+        // --- seal under the PIN-derived KEK --------------------------------
         let arena = arena_slice();
         let kek = derive_kek_in_arena(pin, arena);
         scrub_arena();
@@ -375,11 +467,12 @@ fn derive_subkey(master: &[u8; MASTER_KEY_LEN], domain: &[u8], ctx: &[u8]) -> [u
 /// The XTS disk key (K1 || K2), derived fresh per call, valid only in
 /// the caller's stack frame. Exists only while Unlocked.
 /// CEP: CEP-1 | Complete
-/// Fail: KmsError::Dead / Sealed (fail-closed); Crypto on contract error.
+/// Fail: KmsError::Dead / Refused / Sealed (fail-closed); Crypto on contract error.
 pub fn disk_key() -> Result<[u8; crate::ffi::XTS_KEY_LEN], KmsError> {
     match vault_state() {
         VaultState::Unlocked => {}
         VaultState::Dead | VaultState::Wiping => return Err(KmsError::Dead),
+        VaultState::Refused => return Err(KmsError::Refused),
         VaultState::Sealed => return Err(KmsError::Sealed),
     }
     let mut master = read_master()?;
@@ -418,6 +511,9 @@ pub fn unlock(pin: &[u8]) -> Result<(), UnlockError> {
     match vault_state() {
         VaultState::Dead | VaultState::Wiping => {
             return Err(UnlockError::Dead);
+        }
+        VaultState::Refused => {
+            return Err(UnlockError::Refused);
         }
         VaultState::Sealed | VaultState::Unlocked => {}
     }
@@ -511,7 +607,8 @@ pub fn unlock(pin: &[u8]) -> Result<(), UnlockError> {
 /// Assumes: single CPU (no concurrent access to vault statics).
 fn duress_wipe() {
     unsafe {
-        if STATE == VaultState::Dead {
+        if STATE == VaultState::Dead || STATE == VaultState::Refused {
+            // Both terminal states carry no live secrets to wipe.
             return;
         }
         STATE = VaultState::Wiping;
@@ -548,6 +645,7 @@ pub fn status() -> &'static str {
         VaultState::Unlocked => "UNLOCKED",
         VaultState::Wiping => "WIPING",
         VaultState::Dead => "DEAD",
+        VaultState::Refused => "REFUSED",
     }
 }
 
@@ -558,16 +656,20 @@ pub fn attempts_used() -> u32 {
 
 // --- Leases -----------------------------------------------------------------
 
-/// Grant a lease on a freshly derived key with a `ttl_ticks` lifetime.
+/// Grant a lease on a freshly derived key with a `ttl_ticks` lifetime,
+/// bound to its owner task (v0.7.0: only the owner's `lease_use` can
+/// ever serve the key; a non-owner sees NoSuchLease — indistinguishable
+/// from a missing lease, so ownership is not even observable).
 /// CEP: CEP-1 | Complete
 /// Cost: one BLAKE2b.
-/// Fail: KmsError::Dead / Sealed; Err(Exhausted-as-Crypto) if the table
-///       is full (named via Crypto("LEASES-FULL") — Phase 2 demo scale).
+/// Fail: KmsError::Dead / Refused / Sealed; Err(Exhausted-as-Crypto) if the
+///       table is full (named via Crypto("LEASES-FULL") — Phase 2 demo scale).
 /// Assumes: cooperative single-CPU; lazy expiry (checked at use).
-pub fn lease_grant(ttl_ticks: u64) -> Result<usize, KmsError> {
+pub fn lease_grant(ttl_ticks: u64, owner: usize) -> Result<usize, KmsError> {
     match vault_state() {
         VaultState::Unlocked => {}
         VaultState::Dead | VaultState::Wiping => return Err(KmsError::Dead),
+        VaultState::Refused => return Err(KmsError::Refused),
         VaultState::Sealed => return Err(KmsError::Sealed),
     }
     unsafe {
@@ -589,6 +691,7 @@ pub fn lease_grant(ttl_ticks: u64) -> Result<usize, KmsError> {
         ctx[8..].copy_from_slice(&crate::task::ticks().to_le_bytes());
         LEASES[i].key = derive_subkey(&master, b"redos/lease/v1", &ctx);
         LEASES[i].expires_tick = crate::task::ticks() + ttl_ticks;
+        LEASES[i].owner = owner;
         LEASES[i].in_use = true;
         wipe_bytes(&mut master);
         Ok(i)
@@ -597,17 +700,26 @@ pub fn lease_grant(ttl_ticks: u64) -> Result<usize, KmsError> {
 
 /// Use a lease: expired leases are zeroized on first touch (lazy expiry
 /// is the only expiry — there is no timer interrupt in Phase 2) and the
-/// access fails with `Expired` forever after.
+/// access fails with `Expired` forever after. The `owner` parameter must
+/// name the task the lease was granted to; anything else refuses with
+/// NoSuchLease (same error as a missing id — ownership is not observable
+/// through the error channel).
 /// CEP: CEP-1 | Complete
-/// Fail: Dead/Sealed/NoSuchLease/Expired — all named, all fail-closed.
-pub fn lease_use(id: usize) -> Result<[u8; MASTER_KEY_LEN], KmsError> {
+/// Fail: Dead/Refused/Sealed/NoSuchLease(incl. wrong owner)/Expired — all
+///       named, all fail-closed.
+pub fn lease_use(id: usize, owner: usize) -> Result<[u8; MASTER_KEY_LEN], KmsError> {
     match vault_state() {
         VaultState::Unlocked => {}
         VaultState::Dead | VaultState::Wiping => return Err(KmsError::Dead),
+        VaultState::Refused => return Err(KmsError::Refused),
         VaultState::Sealed => return Err(KmsError::Sealed),
     }
     unsafe {
         if id >= MAX_LEASES || !LEASES[id].in_use {
+            return Err(KmsError::NoSuchLease);
+        }
+        if LEASES[id].owner != owner {
+            // Wrong owner: refuse without revealing the lease exists.
             return Err(KmsError::NoSuchLease);
         }
         if crate::task::ticks() >= LEASES[id].expires_tick {
@@ -617,6 +729,28 @@ pub fn lease_use(id: usize) -> Result<[u8; MASTER_KEY_LEN], KmsError> {
         }
         Ok(LEASES[id].key)
     }
+}
+
+/// The manifest authentication key: a domain-separated derivation from
+/// the master key ("redos/manifest/v1"). The Permission-Tracker world
+/// trusts manifests that carry a valid MAC under this key — the vault
+/// being open IS the trust anchor (zero-ID: authority flows from the
+/// operator's PIN, never from an identity). Exists only inside the
+/// caller's frame; identity.rs wipes it after use.
+/// CEP: CEP-1 | Complete
+/// Fail: Dead / Refused / Sealed (fail-closed: no manifests verify while
+///       the vault is closed — spawning halts with the vault).
+pub fn manifest_key() -> Result<[u8; MASTER_KEY_LEN], KmsError> {
+    match vault_state() {
+        VaultState::Unlocked => {}
+        VaultState::Dead | VaultState::Wiping => return Err(KmsError::Dead),
+        VaultState::Refused => return Err(KmsError::Refused),
+        VaultState::Sealed => return Err(KmsError::Sealed),
+    }
+    let mut master = read_master()?;
+    let key = derive_subkey(&master, b"redos/manifest/v1", &[]);
+    wipe_bytes(&mut master);
+    Ok(key)
 }
 
 // --- Internals --------------------------------------------------------------

@@ -35,7 +35,7 @@ only the scope ceiling is lifted.
 |------|-----|-------|---------------|
 | 25% | v0.5.0 | **Memory physics** (Pillar 2): 4-level paging + HHDM, per-task CR3 roots, Ephemeral Page Allocator (classification, wipe protocol, mlock mandate, anti-swap audit), IDT + #PF probe protocol, zero-copy shared memory with CNode kill switch (write-demotion on transfer, MMU-enforced revocation) | Six MEMPHY banners in QEMU: isolation, wipe, lock, zero-copy, revoke, complete; `Mem.thy` + `Revoke.thy` sorry-free |
 | 50% | v0.6.0 | **RAM-only KMS vault** (Pillar 2): Argon2id (RFC 9106, C core + KAT vectors), PIN → master key into Locked-class frames, XTS-encrypted RAM disk, lease expiry, duress counter / dead-man's wipe | KMS KATs pass; encrypted RAM-disk round-trip in QEMU; wrong-PIN counter destroys the vault (fail-closed) — **DELIVERED** |
-| 75% | v0.7.0 | **Zero-ID identity** (Pillar 1): manifest schema (binary hash, sandbox profile, requested capabilities, lease terms), sandbox spawner, default grants, runtime prompt handshake | Spawner refuses hash mismatch; prompt grants session/lease-scoped caps, tracked by the Permission Tracker |
+| 75% | v0.7.0 | **Zero-ID identity** (Pillar 1): manifest schema (binary hash, sandbox profile, requested capabilities, lease terms), sandbox spawner, default grants, runtime prompt handshake | Spawner refuses hash mismatch; prompt grants session/lease-scoped caps, tracked by the Permission Tracker — **DELIVERED** |
 | 100% | v0.8.0 | **IPC fast-path + Glass Wall** (Pillar 2/5): `syscall`/`sysret` ring transition, rendezvous register path, PCID/invpcid measured optimization, compositor read-only pixel buffers | Fast-path IPC under 100-cycle budget with disassembly evidence; compositor cannot read app memory (MMU-proven) |
 
 **v0.5.0 delivered (this push).** Kernel-side memory physics is real:
@@ -101,6 +101,75 @@ monotonicity across successes, duress destroys + Dead terminality via
 the `dead_inv` invariant, lease lazy expiry + no-serve-without-regrant,
 fail-closed outcomes outside Unlocked, unlock outcome theorems). Zero
 `sorry`; model simplifications recorded in `proof/TODO.md` (items 9-12).
+
+**v0.7.0 delivered (this push).** Zero-ID identity is real — authority
+flows from content and operator decisions, never from identifiers:
+
+* **No secret constants.** The vault PIN is typed through the input
+  service (polled UART RX, masked echo) at seal AND at unlock; the
+  kernel binary carries no PIN (`make secret-audit` greps the image and
+  fails if the operator PIN string ever reappears). The wrong-PIN
+  vector stays a public test input. The entropy policy switch
+  (`RngPolicy`, compile-time) admits only RDRAND under Strict: a
+  machine without hardware entropy enters the terminal `Refused` state
+  instead of pretending (`Kms.thy`: refused_terminal,
+  ev_never_enters_refused — no command enters it; init-only).
+* **Manifests (64 bytes, MAC'd).** magic/version/profile/requested
+  authorities/lease-TTL/binary content hash + keyed-BLAKE2b MAC under a
+  vault-derived key (`redos/manifest/v1` domain separation). The vault
+  being open IS the trust anchor: no PKI, no IDs, and a sealed/dead
+  vault refuses every spawn (fail-closed, proven inert in `Ident.thy`).
+* **Sandbox spawner.** Refusal order: MAC first, then the content hash
+  (BLAKE2b-256 over the entry image — the Phase-2 program model is
+  in-kernel functions; ELF user binaries arrive with ring 3 in
+  v0.8.0), then profile validity. Admitted spawns get a fresh
+  address-space root, the code window mapped READ-ONLY at a private
+  window (the spawn-granted W^X surface — image-wide text RO is a
+  v0.8.0 paging item, documented), and exactly one default grant:
+  SEND/RECV on the prompt endpoint. Default-deny beyond that.
+* **Operator prompt handshake.** Requests flow over the prompt
+  endpoint as fixed 32-byte records; the identity service applies the
+  mechanical TTL policy cap FIRST (STRICT profile: no prompt can
+  exceed the cap — math over trust), then asks the operator over the
+  serial console (any answer but y/Y denies — fail-closed default).
+  Session-scoped grants die with the task; lease-scoped grants are
+  owner-bound KMS leases with tick TTLs (theft refuses with
+  NoSuchLease — indistinguishable from absence).
+* **Permission Tracker.** An append-only ledger: every grant, denial,
+  expiry and revocation is recorded BEFORE the corresponding
+  capability exists (`Ident.thy`: no-cap-without-record preservation
+  across every command and every sequence). Disk I/O consults the
+  tracker at use time (ramdisk NotGranted); task_exit records Revoked
+  and clears the table (session death is mechanical, not conventional).
+* **Bring-up lessons (decision log).** (1) `create_endpoint` now
+  RESERVES its slot — the emptiness test let three creates collide on
+  index 0, silently merging every endpoint's traffic; (2) `yield_tick`
+  is now fair (scan from cur+1, self-switch only as the last resort) —
+  the old scan-from-cur always re-picked the yielding task and starved
+  every task woken while it kept yielding; (3) a woken receiver must
+  consume the `delivered` flag before re-entering recv (the v0.3.0
+  lesson, relearned by the vault client's completion wait).
+
+Formal specs added at v0.7.0: `proof/Ident.thy` (manifest spawner:
+refusal inertness, admission atomicity, tracked-capability invariant,
+TTL policy cap, operator-denial neutrality, expiry + exit clearance)
+and `proof/Kms.thy` extensions (entropy policy decision table, the
+terminal Refused state with its own reachability invariant). Zero
+`sorry`; model simplifications recorded in `proof/TODO.md` (items
+14-18).
+
+**CI repairs (review-gate finds, v0.7.0 closes).** The independent
+review surfaced two latent failures the local sandbox could never see:
+(1) the CI proof job had not RUN since v0.4.0 — a hanging Isabelle
+mirror consumed the job's whole timeout (downloads are now hard-bounded
+per mirror across four mirrors), and the reviewer's hand-proof audit
+found a real latent bug the dead job had been hiding
+(`wrong_pin_stays_sealed` needed the `key_inv` reachability premise —
+fixed); (2) the CI boot job failed on firmware memory maps larger than
+the bootloader's 128-entry table (local QEMU emits exactly 123) — the
+bootloader now coalesces the map into maximal same-kind regions under a
+256-entry contract bound that matches the kernel's handoff validation.
+The README ledger records the red history.
 
 ## Phase 3 — The Selective FHE Engine (next cycle)
 

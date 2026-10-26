@@ -25,15 +25,22 @@ text \<open>
     duress) both refuse. The QEMU scenario asserts the empirical half
     (the VaultDead error after the duress banner).
 
-  Model simplifications are recorded in proof/TODO.md (items 9--12);
-  the load-bearing one is that PIN correctness is an authenticated
+  v0.7.0 additions: the entropy policy (\<open>rng_admits\<close>) and the terminal
+  \<open>VRefused\<close> state -- a vault sealed under a Strict RNG policy with
+  non-RDRAND entropy never generates a master key at all; it refuses
+  every command exactly like a dead vault (\<open>refused_terminal\<close>,
+  \<open>refused_never_serves\<close>), and no command can ENTER the state (it is
+  an initial-state-only outcome of init, never of a transition).
+
+  Model simplifications are recorded in proof/TODO.md (items 9--13 and
+  17); the load-bearing one is that PIN correctness is an authenticated
   unwrap (GCM tag under the Argon2id KEK), so a ``correct PIN'' command
   is by construction the only command that can move Sealed to Unlocked.
 \<close>
 
 subsection \<open>States and commands\<close>
 
-datatype vstate = VSealed | VUnlocked | VWiping | VDead
+datatype vstate = VSealed | VUnlocked | VWiping | VDead | VRefused
 
 datatype kms_cmd =
   KUnlock bool           \<comment> \<open>attempt unlock; True = correct PIN\<close>
@@ -66,7 +73,7 @@ text \<open>Malformed commands leave the vault unchanged -- the named errors
 
 fun ev :: "vault \<Rightarrow> kms_cmd \<Rightarrow> vault" where
   "ev v (KUnlock pin) =
-     (if vst v = VDead \<or> vst v = VWiping then v
+     (if vst v = VDead \<or> vst v = VWiping \<or> vst v = VRefused then v
       else if vatt v + 1 \<ge> BUDGET
       then v\<lparr> vst := VDead, vkeys := False,
               vlact := (\<lambda>_. False), vlkey := (\<lambda>_. False) \<rparr>
@@ -102,7 +109,7 @@ fun ok :: "vault \<Rightarrow> kms_cmd \<Rightarrow> bool" where
   "ok v (KUse i) = (vst v = VUnlocked \<and> vlact v i \<and> vtick v < vlexp v i)"
 | "ok v KDiskRead  = (vst v = VUnlocked \<and> vkeys v)"
 | "ok v KDiskWrite = (vst v = VUnlocked \<and> vkeys v)"
-| "ok v (KUnlock _) = (vst v \<noteq> VDead \<and> vst v \<noteq> VWiping)"
+| "ok v (KUnlock _) = (vst v \<noteq> VDead \<and> vst v \<noteq> VWiping \<and> vst v \<noteq> VRefused)"
 | "ok v (KGrant _ _) = (vst v = VUnlocked)"
 | "ok v KTick = True"
 
@@ -250,6 +257,79 @@ theorem dead_never_serves:
   shows "\<not> ok v KDiskRead \<and> \<not> ok v KDiskWrite \<and> \<not> ok v (KUse i)"
   using dead by simp
 
+subsection \<open>Entropy policy and the Refused state (v0.7.0)\<close>
+
+text \<open>The compile-time policy switch (kernel/src/kms.rs RngPolicy) and
+      the entropy sources the seal path can report. Strict builds admit
+      only hardware RDRAND; the weak TSC fallback is admitted only under
+      Lenient (and must be surfaced honestly in the boot log).\<close>
+
+datatype rng_policy = RLenient | RStrict
+datatype rng_source = SRdrand | SWeak
+
+definition rng_admits :: "rng_policy \<Rightarrow> rng_source \<Rightarrow> bool" where
+  "rng_admits p s \<equiv> p = RLenient \<or> s = SRdrand"
+
+theorem strict_refuses_weak:
+  "\<not> rng_admits RStrict SWeak"
+  by (simp add: rng_admits_def)
+
+theorem strict_admits_rdrand:
+  "rng_admits RStrict SRdrand"
+  by (simp add: rng_admits_def)
+
+theorem lenient_admits_all:
+  "rng_admits RLenient s"
+  by (simp add: rng_admits_def)
+
+text \<open>VRefused: entered only by init (before the first command), never
+      by a transition. It is terminal like VDead: every command leaves
+      it (and its zeroed key material) untouched, and nothing serves.
+      Terminality needs the same reachability discipline as Dead
+      (refused_inv: a refused vault carries no key material and no live
+      leases -- init wipes the drawn key and zeroizes the blob before
+      entering the state, and nothing else can create keys there).\<close>
+
+definition refused_inv :: "vault \<Rightarrow> bool" where
+  "refused_inv v \<equiv> vst v = VRefused \<longrightarrow>
+     (\<not> vkeys v \<and> (\<forall>i. \<not> vlact v i \<and> \<not> vlkey v i))"
+
+theorem ev_preserves_refused_inv:
+  assumes "refused_inv v"
+  shows "refused_inv (ev v c)"
+  using assms by (cases c) (auto simp: refused_inv_def BUDGET_def
+    split: vstate.splits)
+
+theorem ev_never_enters_refused:
+  assumes "vst v \<noteq> VRefused"
+  shows "vst (ev v c) \<noteq> VRefused"
+  using assms by (cases c) (auto split: vstate.splits)
+
+theorem refused_state_stable:
+  assumes refused: "vst v = VRefused"
+  shows "vst (ev v c) = VRefused"
+  using refused by (cases c) (auto split: vstate.splits)
+
+theorem refused_terminal:
+  assumes inv: "refused_inv v"
+    and refused: "vst v = VRefused"
+  shows "vst (ev v c) = VRefused
+     \<and> \<not> vkeys (ev v c)
+     \<and> \<not> vlact (ev v c) i
+     \<and> \<not> vlkey (ev v c) i"
+proof -
+  have st: "vst (ev v c) = VRefused"
+    using refused refused_state_stable by blast
+  have inv': "refused_inv (ev v c)"
+    using assms ev_preserves_refused_inv by blast
+  from inv' st show ?thesis by (simp add: refused_inv_def)
+qed
+
+theorem refused_never_serves:
+  assumes refused: "vst v = VRefused"
+  shows "\<not> ok v KDiskRead \<and> \<not> ok v KDiskWrite \<and> \<not> ok v (KUse i) \<and> \<not> ok v (KUnlock p)"
+  using refused by simp
+
 subsection \<open>Leases: lazy expiry, refuse-after-expiry, fresh re-grant\<close>
 
 text \<open>THEOREM (lease expiry wipes): a use at or after the expiry tick
@@ -324,16 +404,24 @@ theorem unlock_opens_under_budget:
   shows "vst (ev v (KUnlock True)) = VUnlocked
      \<and> vkeys (ev v (KUnlock True))
      \<and> vatt (ev v (KUnlock True)) = vatt v + 1"
-  using sealed under by (simp add: BUDGET_def)
+  using sealed under by (auto simp: BUDGET_def split: vstate.splits if_splits)
 
 text \<open>A wrong-PIN attempt (tag failure) leaves the vault sealed and
-      only advances the counter.\<close>
+      only advances the counter. Key-freedom of the result needs the
+      reachability invariant (a sealed vault carries no keys -- the
+      state alone cannot exclude a nonsense record literal with
+      vkeys=True): key_inv supplies exactly that.\<close>
 
 theorem wrong_pin_stays_sealed:
   assumes sealed: "vst v = VSealed"
     and under: "vatt v + 1 < BUDGET"
+    and kinv: "key_inv v"
   shows "vst (ev v (KUnlock False)) = VSealed
      \<and> \<not> vkeys (ev v (KUnlock False))
      \<and> vatt (ev v (KUnlock False)) = vatt v + 1"
-  using sealed under by (simp add: BUDGET_def)
+proof -
+  from kinv sealed have nokeys: "\<not> vkeys v"
+    by (auto simp: key_inv_def)
+  from sealed under nokeys show ?thesis by (simp add: BUDGET_def)
+qed
 end

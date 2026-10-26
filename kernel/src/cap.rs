@@ -13,6 +13,12 @@
 //!       (fail-fast). Policy-based degradation is Phase 2+ (audit log).
 //! Assumes: single kernel thread mutates tables (cooperative model);
 //!          MAX_CAPS=16 per task, static tables (no heap).
+//!
+//! v0.7.0: the per-task tables moved here from main.rs statics — one
+//! canonical `TABLES` array indexed by task slot. `task::task_exit` calls
+//! `clear_table` on the dying task, making "session-scoped authority dies
+//! with the task" a mechanical property instead of a convention
+//! (proof/Ident.thy: session_death).
 
 /// Capability rights (monotone lattice: subset ordering; GRANT implies
 /// the right being granted may be transferred only if held).
@@ -68,6 +74,7 @@ const fn free_slot() -> CapSlot {
 }
 
 /// Per-task capability table (CNode).
+#[derive(Clone, Copy)]
 pub struct CTable {
     pub slots: [CapSlot; MAX_CAPS],
 }
@@ -148,8 +155,51 @@ impl CTable {
     /// Cost: O(1). Revocation is monotone: rights only shrink.
     /// Fail: cannot fail (revoking a free slot is a no-op by design).
     /// Phase 2 callers: audit-log + policy engine exercise revoke.
-    #[allow(dead_code)]
     pub fn revoke(&mut self, slot: usize) {
         self.slots[slot].kind = CapKind::Free;
     }
+}
+
+// --- Kernel-wide per-task table array (v0.7.0) -------------------------------
+
+/// The canonical CNode per task slot. Indexed by task index (task.rs);
+/// slot 0 (kmain) exists but never carries authority in Phase 2.
+static mut TABLES: [CTable; crate::task::MAX_TASKS] = [CTable::new(); crate::task::MAX_TASKS];
+
+/// The capability table of task `task`.
+/// CEP: CEP-1 | Complete
+/// Cost: O(1) indexed access.
+/// Fail: panics on an out-of-range task index (a forged task reference
+///       must never look like an empty table).
+#[allow(static_mut_refs)]
+pub fn table_of(task: usize) -> &'static mut CTable {
+    assert!(task < crate::task::MAX_TASKS, "cap: task index OOB");
+    unsafe { &mut *core::ptr::addr_of_mut!(TABLES[task]) }
+}
+
+/// Revoke EVERY capability the task holds (session death). Called by
+/// `task::task_exit` — after this, no slot of the dead task's table can
+/// pass any lookup: authority cannot outlive its holder.
+/// CEP: CEP-1 | Complete
+/// Cost: O(MAX_CAPS) slot clears.
+/// Fail: cannot fail (revoking a free slot is a no-op).
+#[allow(static_mut_refs)]
+pub fn clear_table(task: usize) {
+    assert!(task < crate::task::MAX_TASKS, "cap: task index OOB");
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(TABLES[task]) };
+    for slot in t.slots.iter_mut() {
+        slot.kind = CapKind::Free;
+    }
+}
+
+/// Whether the task's table still holds any capability (identity::service
+/// uses this as post-exit evidence that session death was mechanical).
+/// CEP: CEP-1 | Complete
+/// Cost: O(MAX_CAPS) scan.
+/// Fail: cannot fail.
+#[allow(static_mut_refs)]
+pub fn table_empty(task: usize) -> bool {
+    assert!(task < crate::task::MAX_TASKS, "cap: task index OOB");
+    let t = unsafe { &*core::ptr::addr_of!(TABLES[task]) };
+    t.slots.iter().all(|s| matches!(s.kind, CapKind::Free))
 }

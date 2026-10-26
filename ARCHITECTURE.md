@@ -74,7 +74,27 @@ The coding standard is CEP&CC 0.1 (`standard.md` at repository root).
   - *XTS RAM disk* (`ramdisk.rs`, v0.6.0): 512 B sectors as IEEE 1619
     data units, per-op derived keys, fail-closed I/O outside Unlocked,
     encryption-at-rest asserted in the boot scenario (raw bytes are
-    ciphertext).
+    ciphertext). v0.7.0: every I/O carries the caller's task index and
+    consults the Permission Tracker — no live DISK authority, no I/O
+    (`NotGranted`), fail-closed.
+  - *Input service* (`input.rs`, v0.7.0): polled 16550 RX assembled
+    into lines. The ONLY path operator secrets take — masked echo for
+    PINs (the serial log archives stars, never keystrokes), plain echo
+    for grant decisions (the log is the audit trail). Callers yield
+    while the human types (fair tick-yield); kmain tight-polls before
+    the first spawn. No secret constant exists in the kernel binary
+    (`make secret-audit`).
+  - *Zero-ID identity* (`identity.rs`, v0.7.0): 64-byte MAC'd manifests
+    (profile, requested authorities, lease terms, BLAKE2b-256 content
+    hash of the entry image; keyed-BLAKE2b MAC under a vault-derived
+    key — a closed vault refuses every spawn). Sandbox spawner: fresh
+    CR3 root, RO code window, one default grant (prompt endpoint),
+    default-deny otherwise. Runtime prompt handshake over a fixed
+    32-byte record protocol with the mechanical TTL policy cap ahead
+    of the operator's y/n. Permission Tracker: append-only ledger,
+    record-before-mint ordering (`Ident.thy`: no cap without record),
+    session death enforced by task_exit (tracker Revoked + table
+    clear), lease theft refused by owner binding in the KMS.
 
 ### Layer 2 — Userspace runtime & crypto engines — Rust + C
 - **Capability-aware libc**: minimal, `no_std`-compatible core (Phase 2).
@@ -132,6 +152,9 @@ manager (Phase 4).
 | IDTR layout | `repr(C, packed(1))` — limit@0, base@2 | The hardware IDTR is packed; a padded struct loads garbage (v0.5.0 bring-up lesson, caught by the sidt readback assertion) |
 | PTE coherence | `invlpg` after flag-change/unmap on the CURRENT root | Without it the CPU serves stale RW/live translations (v0.5.0 bring-up lesson) |
 | Git protocol | main + annotated tags at each 25% milestone | Reviewable quarterly pushes; scope widened by user directive (no LOC ceiling) |
+| v0.7.0 scheduler fairness | `yield_tick` scans from cur+1 (self-switch only as fallback) | Scanning from cur always re-picked the yielding task — tasks woken while it yielded starved forever (observed: the identity service never ran) |
+| v0.7.0 endpoint identity | `create_endpoint` reserves its slot (used flag) | Slot reservation by mailbox-emptiness let three creates collide on index 0, silently merging all endpoints' traffic (observed) |
+| v0.7.0 entropy policy | Compile-time RngPolicy; Strict + non-RDRAND enters terminal Refused | A vault that cannot be seeded honestly must not pretend (fail-closed over fail-open) |
 
 ## LOC ledger (targets from the approved blueprint)
 

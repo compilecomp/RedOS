@@ -38,6 +38,10 @@ pub struct Message {
 /// IPC endpoint kernel object.
 #[derive(Clone, Copy)]
 pub struct Endpoint {
+    /// Slot reserved (create_endpoint marks it; the emptiness of the
+    /// mailbox alone is NOT a reservation — three creates would all
+    /// collide on slot 0, observed in v0.7.0 bring-up).
+    pub used: bool,
     /// Bounded mailbox (1 slot).
     pub pending: Option<Message>,
     /// True if a receiver task is blocked on this endpoint.
@@ -50,6 +54,7 @@ pub struct Endpoint {
 
 const fn new_endpoint() -> Endpoint {
     Endpoint {
+        used: false,
         pending: None,
         recv_waiter: None,
         send_waiter: None,
@@ -70,12 +75,15 @@ pub fn endpoints() -> &'static mut [Endpoint; MAX_ENDPOINTS] {
 /// CEP: CEP-1 | Complete
 /// Cost: O(1). Creates an endpoint and returns its kernel index.
 /// Fail: panics when all endpoint slots are used (named capacity limit).
+///       The slot is RESERVED at create time (used flag): endpoint
+///       identity is index-stable for the capability tokens that name it.
 pub fn create_endpoint() -> usize {
     let eps = endpoints();
-    match eps.iter().position(|e| {
-        e.pending.is_none() && e.recv_waiter.is_none() && e.send_waiter.is_none() && e.staged.is_none()
-    }) {
-        Some(i) => i,
+    match eps.iter().position(|e| !e.used) {
+        Some(i) => {
+            eps[i].used = true;
+            i
+        }
         None => crate::panic_str("ipc: ", "endpoint table full"),
     }
 }

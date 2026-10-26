@@ -79,6 +79,44 @@ spirit; the ledger is reviewed at every quarterly push.
    theorems about outcomes use the state-machine consequences instead;
    (c) lease use does not distinguish NoSuchLease from Expired (both
    refuse; the kernel's named errors are finer-grained than the model).
+14. `Ident.thy` models the manifest MAC and the binary content hash as
+   abstract values (`mmac_ok :: bool`, `mhash/phash :: nat`): the
+   concrete bindings are keyed-BLAKE2b under a vault-derived key and
+   BLAKE2b-256 over the entry image — both pinned by KATs (RFC 7693
+   host suite) and exercised empirically by the QEMU spawn refusals
+   (MAC-REFUSED / HASH-REFUSED banners). A cryptographic model of
+   BLAKE2b is out of scope for the TCB model.
+15. `Ident.thy` takes the operator's prompt decision as a command
+   parameter (`ILeaseReq ... bool` / `IDiskReq ... bool`): the prompt
+   handshake is the human half, outside the TCB by design. The model
+   proves what the KERNEL enforces around that decision (policy caps
+   are mechanical, denials never grant, every decision is recorded).
+   The kernel's three denial sub-reasons (policy cap / forged request /
+   KMS error) merge into one DDenied outcome — same observable effect
+   (record + no cap), finer-grained notes live in the kernel's ledger.
+16. `Ident.thy` does not model task-slot non-reuse: the kernel never
+   recycles Dead slots (`task::spawn` scans Free only, `spawn_at`
+   ditto), so a respawned index is impossible in the implementation.
+   The model's ISpawn guard is only `¬ ialive s t`; a post-exit respawn
+   of the same index would start a fresh authority lifetime with its
+   own records (the tracked invariant still holds). Structural closure
+   (an `ever_spawned` registry) is deferred to the ring-3 identity
+   milestone, where task identity becomes structural anyway.
+18. `Ident.thy` proves the one-directional tracker invariant (a live
+   authority implies a Granted record exists); the kernel's
+   `has_authority` is stronger: LATEST record wins (a later
+   Denied/Revoked/Expired supersedes an earlier Granted). The kernel is
+   the more conservative of the two and the model's theorems are all
+   one-directional, so nothing overclaims — but the liveness semantics
+   (latest-wins) is enforced only in the implementation. If a milestone
+   ever needs the kernel's exact liveness (e.g. to prove a denial
+   cannot resurrect authority), extend the model with the
+   latest-decision function and prove it there.
+17. `Kms.thy` models the seal step as pre-history (the vault starts in
+   VSealed or VRefused); init's Argon2id seal and the entropy-policy
+   gate are covered by the rng_admits theorems + the KAT suite, not by
+   a KSeal command. A model of init would need the Argon2id arena in
+   the vault record — deferred until a milestone touches it.
 
 ## Next proof targets (Phase 2+)
 
@@ -88,4 +126,8 @@ spirit; the ledger is reviewed at every quarterly push.
   destroyed-vault fail-closed, lease lazy expiry, unlock outcomes).
 - XTS sector encryption: tweak independence (with the v0.7.0 storage
   hardening; the IEEE 1619 KAT pins the crypto half meanwhile).
-- Manifest spawner: hash-mismatch refusal is monotone (with v0.7.0).
+- Manifest spawner: DONE at v0.7.0 (`Ident.thy`: refusal inertness,
+  default-grant atomicity, no-cap-without-record preservation, TTL
+  policy cap, operator-denial neutrality, expiry/exit clearance).
+- Runtime request protocol: multi-task concurrent request queues (the
+  one-sandbox model covers v0.7.0's single sandbox slot).

@@ -50,7 +50,22 @@ const HANDOFF_DESC_VER: u32 = 1; // expected UEFI memory map version
 const MEM_USABLE: u64 = 1;
 const MEM_RESERVED: u64 = 2;
 
-const MAX_MMAP_ENTRIES: usize = 128;
+/// Capacity of the normalized handoff map. MUST equal the kernel's
+/// `Handoff::validate` bound (kernel/src/handoff.rs). Firmware maps are
+/// COALESCED into maximal same-kind regions (see collect_map), so this
+/// bound is comfortable for any realistic firmware — but it stays a
+/// named error if exceeded (never a silent truncation). The original
+/// 128-entry hard cap died on CI runners whose OVMF emitted >128 raw
+/// descriptors (v0.7.0 repair; local QEMU emitted exactly 123).
+const MAX_MMAP_ENTRIES: usize = 256;
+
+/// UEFI memory types we normalize to MEM_USABLE (everything else is
+/// reserved). Module scope: shared by both memory-map walks.
+const T_LOADER_CODE: u32 = 1;
+const T_LOADER_DATA: u32 = 2;
+const T_BS_CODE: u32 = 3;
+const T_BS_DATA: u32 = 4;
+const T_CONVENTIONAL: u32 = 7;
 
 const MemEntry = extern struct {
     base: u64,
@@ -70,6 +85,53 @@ const Handoff = extern struct {
 
 /// Normalized memory map storage (bootloader image memory, persists post-EBS).
 var mmap_entries: [MAX_MMAP_ENTRIES]MemEntry = undefined;
+
+/// Walk the firmware descriptor buffer into the static handoff map,
+/// COALESCING contiguous same-kind regions into maximal ones. Firmware
+/// fragmentation (MMIO holes, boot-services granularity) can exceed any
+/// fixed entry budget; the kernel contract needs maximal regions, not
+/// firmware bookkeeping. Returns the coalesced entry count; dies with a
+/// named error only if even the coalesced map exceeds the table (no
+/// silent truncation, ever).
+/// CEP: CEP-1 | Complete (v0.7.0: extracted from the duplicated walks)
+/// Cost: O(descriptors).
+/// Fail: die("memory map overflow") when MAX_MMAP_ENTRIES is exceeded.
+fn collect_map(buf: [*]const u8, desc_size: usize, count: usize) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const rec = buf + i * desc_size;
+        // EFI_MEMORY_DESCRIPTOR field offsets (little-endian):
+        //   type @ 0 (u32), physical_start @ 8 (u64), number_of_pages @ 24 (u64)
+        const d_type = std.mem.readInt(u32, rec[0..4], .little);
+        const phys = std.mem.readInt(u64, rec[8..16], .little);
+        const pages = std.mem.readInt(u64, rec[24..32], .little);
+        const len = pages *| 0x1000;
+        if (len == 0) continue;
+        const kind: u64 = switch (d_type) {
+            T_LOADER_CODE, T_LOADER_DATA, T_BS_CODE, T_BS_DATA, T_CONVENTIONAL => MEM_USABLE,
+            else => MEM_RESERVED,
+        };
+        // Contiguous extension of the previous same-kind region? Merge
+        // (saturating arithmetic: an overflowing base+len can never equal
+        // phys, so the merge simply does not fire).
+        if (n > 0) {
+            const prev = &mmap_entries[n - 1];
+            if (prev.kind == kind and prev.base +| prev.len == phys) {
+                prev.len +|= len;
+                continue;
+            }
+        }
+        if (n >= MAX_MMAP_ENTRIES) die("memory map overflow", .OutOfResources);
+        mmap_entries[n] = .{
+            .base = phys,
+            .len = len,
+            .kind = kind,
+        };
+        n += 1;
+    }
+    return n;
+}
 
 // ---------------------------------------------------------------------------
 // Serial debug output (direct 16550 port I/O; works before ExitBootServices)
@@ -265,33 +327,11 @@ pub fn main() usize {
     const desc_count = mmap_size / desc_size;
     // EFI_MEMORY_DESCRIPTOR field offsets (little-endian):
     //   type @ 0 (u32), physical_start @ 8 (u64), number_of_pages @ 24 (u64)
-    const T_LOADER_CODE: u32 = 1;
-    const T_LOADER_DATA: u32 = 2;
-    const T_BS_CODE: u32 = 3;
-    const T_BS_DATA: u32 = 4;
-    const T_CONVENTIONAL: u32 = 7;
-
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < desc_count) : (i += 1) {
-        if (n >= MAX_MMAP_ENTRIES) die("memory map overflow", .OutOfResources);
-        const rec = mmap_buf + i * desc_size;
-        const d_type = std.mem.readInt(u32, rec[0..4], .little);
-        const phys = std.mem.readInt(u64, rec[8..16], .little);
-        const pages = std.mem.readInt(u64, rec[24..32], .little);
-        const len = pages *| 0x1000;
-        if (len == 0) continue;
-        const kind: u64 = switch (d_type) {
-            T_LOADER_CODE, T_LOADER_DATA, T_BS_CODE, T_BS_DATA, T_CONVENTIONAL => MEM_USABLE,
-            else => MEM_RESERVED,
-        };
-        mmap_entries[n] = .{
-            .base = phys,
-            .len = len,
-            .kind = kind,
-        };
-        n += 1;
-    }
+    // Coalesced, normalized map (maximal same-kind regions; see collect_map).
+    // The kernel contract needs maximal regions, not firmware bookkeeping —
+    // and a coalesced map fits the fixed handoff table on any realistic
+    // firmware (v0.7.0 repair: raw maps overflowed 128 entries on CI).
+    const n = collect_map(mmap_buf, desc_size, desc_count);
     serial_write("[REDOS-BOOT] memory map: ");
     serial_hex(n);
     serial_write(" entries (stride ");
@@ -319,26 +359,7 @@ pub fn main() usize {
         if (desc_size < 40) die("memory map stride < 40 (retry)", .Unsupported);
         if (desc_ver != HANDOFF_DESC_VER) die("memory map version != 1 (retry)", .IncompatibleVersion);
         const rc2 = mmap_size / desc_size;
-        var m: usize = 0;
-        var j: usize = 0;
-        while (j < rc2) : (j += 1) {
-            if (m >= MAX_MMAP_ENTRIES) die("memory map overflow (retry)", .OutOfResources);
-            const rec = mmap_buf + j * desc_size;
-            const d_type = std.mem.readInt(u32, rec[0..4], .little);
-            const phys = std.mem.readInt(u64, rec[8..16], .little);
-            const pages = std.mem.readInt(u64, rec[24..32], .little);
-            const len = pages *| 0x1000;
-            if (len == 0) continue;
-            mmap_entries[m] = .{
-                .base = phys,
-                .len = len,
-                .kind = switch (d_type) {
-                    T_LOADER_CODE, T_LOADER_DATA, T_BS_CODE, T_BS_DATA, T_CONVENTIONAL => MEM_USABLE,
-                    else => MEM_RESERVED,
-                },
-            };
-            m += 1;
-        }
+        const m = collect_map(mmap_buf, desc_size, rc2);
         handoff.mmap_len = m;
         st = bs.exitBootServices(uefi.handle, map_key);
     }

@@ -5,3 +5,4 @@ session RedOS_Proofs = HOL +
     Mem
     Revoke
     Kms
+    Ident

@@ -25,13 +25,21 @@
 //! wholesale plaintext injection. Full authenticated sectors (GCM per
 //! sector) are a deliberate v0.7.0+ decision tracked in docs/ROADMAP.md.
 //!
+//! * **Authority-gated I/O (v0.7.0).** Every I/O call carries the caller's
+//!   task index and consults the Permission Tracker (identity.rs):
+//!   no live DISK authority, no I/O — `DiskError::NotGranted`, recorded
+//!   policy, not a convention. The vault-coupled lifetime checks run
+//!   FIRST (a dead vault fails closed before any authority question).
+//!
 //! CEP: CEP-1 | Complete (Phase 2 scope: 16 sectors of 512 B)
 //! Cost: one XTS data-unit op per sector I/O (+ one BLAKE2b key
 //!       derivation, which dominates at 512 B scale — and that IS the
 //!       design: the key exists for the shortest possible time).
-//! Fail: named errors; the disk refuses ALL I/O once the vault is dead.
+//! Fail: named errors; the disk refuses ALL I/O once the vault is dead,
+//!       and refuses ALL I/O from tasks without live DISK authority.
 //! Assumes: single CPU; called after kms is Unlocked (or expects the
-//!          named Dead/Sealed errors otherwise).
+//!          named Dead/Sealed errors otherwise); caller passes its true
+//!          task index (ring-3 boundary makes this structural in v0.8.0).
 
 use crate::mm::phys::{self, PageClass, PAGE_SIZE};
 use crate::serial;
@@ -91,27 +99,46 @@ pub enum DiskError {
     VaultDead,
     /// Vault not unlocked.
     VaultSealed,
+    /// Vault refused at seal (strict-RNG policy) — terminal.
+    VaultRefused,
+    /// Caller holds no live DISK authority in the Permission Tracker.
+    NotGranted,
     /// Sector index out of range.
     BadSector,
     /// C-core contract error.
     Crypto(#[allow(dead_code)] &'static str),
 }
 
+/// Authority gate (v0.7.0): the tracker decides, the disk enforces.
+/// CEP: CEP-1 | Complete
+/// Cost: O(tracker records) scan.
+/// Fail: DiskError::NotGranted — named, never silent.
+fn check_authority(owner: usize) -> Result<(), DiskError> {
+    if crate::identity::has_authority(owner, crate::identity::AUTH_DISK) {
+        Ok(())
+    } else {
+        Err(DiskError::NotGranted)
+    }
+}
+
 /// Read one sector: XTS-decrypt(derive(master, sector n), stored ct).
 ///
 /// CEP: CEP-1 | Complete
-/// Cost: one BLAKE2b derivation + one 512 B XTS decrypt; the disk key
-///       lives only inside this call (stack), zeroized on return.
-/// Fail: DiskError::VaultDead/Sealed (fail-closed), BadSector, Crypto.
-pub fn read_sector(n: usize, out: &mut [u8; SECTOR_SIZE]) -> Result<(), DiskError> {
+/// Cost: one tracker scan + one BLAKE2b derivation + one 512 B XTS
+///       decrypt; the disk key lives only inside this call (stack),
+///       zeroized on return.
+/// Fail: DiskError::VaultDead/Refused/Sealed (fail-closed), NotGranted,
+///       BadSector, Crypto.
+pub fn read_sector(owner: usize, n: usize, out: &mut [u8; SECTOR_SIZE]) -> Result<(), DiskError> {
     let mut key = match crate::kms::disk_key() {
         Ok(k) => k,
         Err(crate::kms::KmsError::Dead) => return Err(DiskError::VaultDead),
+        Err(crate::kms::KmsError::Refused) => return Err(DiskError::VaultRefused),
         Err(crate::kms::KmsError::Sealed) => return Err(DiskError::VaultSealed),
         Err(crate::kms::KmsError::Crypto(e)) => return Err(DiskError::Crypto(e)),
         Err(_) => return Err(DiskError::Crypto("UNKNOWN")),
     };
-    let r = read_sector_with_key(n, out, &key);
+    let r = check_authority(owner).and_then(|()| read_sector_with_key(n, out, &key));
     zero_key(&mut key);
     r
 }
@@ -120,17 +147,23 @@ pub fn read_sector(n: usize, out: &mut [u8; SECTOR_SIZE]) -> Result<(), DiskErro
 /// frame slot. The data unit number IS the sector number.
 ///
 /// CEP: CEP-1 | Complete
-/// Cost: one BLAKE2b derivation + one 512 B XTS encrypt; key zeroized.
+/// Cost: one tracker scan + one BLAKE2b derivation + one 512 B XTS
+///       encrypt; key zeroized.
 /// Fail: as read_sector.
-pub fn write_sector(n: usize, data: &[u8; SECTOR_SIZE]) -> Result<(), DiskError> {
+pub fn write_sector(
+    owner: usize,
+    n: usize,
+    data: &[u8; SECTOR_SIZE],
+) -> Result<(), DiskError> {
     let mut key = match crate::kms::disk_key() {
         Ok(k) => k,
         Err(crate::kms::KmsError::Dead) => return Err(DiskError::VaultDead),
+        Err(crate::kms::KmsError::Refused) => return Err(DiskError::VaultRefused),
         Err(crate::kms::KmsError::Sealed) => return Err(DiskError::VaultSealed),
         Err(crate::kms::KmsError::Crypto(e)) => return Err(DiskError::Crypto(e)),
         Err(_) => return Err(DiskError::Crypto("UNKNOWN")),
     };
-    let r = write_sector_with_key(n, data, &key);
+    let r = check_authority(owner).and_then(|()| write_sector_with_key(n, data, &key));
     zero_key(&mut key);
     r
 }

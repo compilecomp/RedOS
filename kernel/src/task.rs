@@ -23,7 +23,7 @@
 use crate::serial;
 use core::arch::naked_asm;
 
-pub const MAX_TASKS: usize = 4;
+pub const MAX_TASKS: usize = 6;
 pub const STACK_SIZE: usize = 16 * 1024;
 
 /// Callee-saved register image. Offsets MUST match `switch_to`:
@@ -97,7 +97,7 @@ pub struct RecvReq {
     pub max_len: usize,
 }
 
-// Static task table: no heap in the kernel (Law 1). 4 tasks × 16 KiB = 64 KiB
+// Static task table: no heap in the kernel (Law 1). 6 tasks × 16 KiB = 96 KiB
 // of .bss — inside the 4 MiB load window enforced by linker.ld.
 static mut TASKS: [Task; MAX_TASKS] = [new_task(); MAX_TASKS];
 
@@ -172,6 +172,40 @@ pub unsafe extern "C" fn switch_to(old: *mut Context, new: *const Context) {
         "pop rbp",
         "ret"
     )
+}
+
+/// Spawn a task whose entry lives at raw address `entry_addr` (the
+/// identity-manifest spawner's interface: the manifest binds the entry
+/// by CONTENT hash, the spawner passes the resolved address). Same stack
+/// image and slot discipline as `spawn`.
+/// CEP: CEP-1 | Complete
+/// Cost / Fail / Assumes: as `spawn`; additionally the caller guarantees
+///       the address is real kernel text (a bad address faults on first
+///       schedule — the manifest hash check exists to make that impossible).
+pub fn spawn_at(entry_addr: u64, arg: u64) -> usize {
+    // Find a free slot (skipping slot 0 — kmain's reservation).
+    let slots = tasks();
+    let idx = match slots[1..]
+        .iter()
+        .position(|t| matches!(t.state, TaskState::Free))
+    {
+        Some(i) => i + 1,
+        None => panic_str("spawn_at: no free task slot"),
+    };
+
+    let task = &mut slots[idx];
+    let base = task.stack.as_mut_ptr() as u64;
+    let img_hi = base + STACK_SIZE as u64;
+    let s = (img_hi - 48) & !0xF;
+
+    unsafe {
+        write_stack(s, task_bootstrap as unsafe extern "C" fn() -> ! as u64);
+        write_stack(s + 8, arg as u64);
+        write_stack(s + 16, entry_addr);
+        task.ctx.rsp = s - 48;
+    }
+    task.state = TaskState::Runnable;
+    idx
 }
 
 /// CEP: CEP-1 | Complete
@@ -299,42 +333,59 @@ pub fn scheduler_run() -> ! {
     }
 }
 
-/// Cooperative tick-yield: switch to the next runnable task (possibly
-/// THIS task — a self-switch still loads CR3-free, saves/restores the
-/// same context, and bumps the scheduler tick). This is the clock tick
-/// primitive for lease expiry (kms.rs): unlike `schedule_from`, it NEVER
-/// halts when the caller is the only runnable task and NEVER picks the
-/// abandoned kmain slot (slot 0 is marked non-Runnable at boot).
+/// Cooperative tick-yield: hand the CPU to the next runnable task,
+/// bumping the scheduler tick (the ONLY clock the KMS vault gets — see
+/// kms.rs and proof/Kms.thy).
+///
+/// FAIRNESS (v0.7.0 bring-up lesson): the scan starts at cur+1 and only
+/// falls back to a self-switch when the caller is the ONLY runnable
+/// task. The v0.6.0 semantics (scan from cur) always re-picked the
+/// caller, which starved every task woken while the caller kept
+/// yielding — observed when the identity service (spawned Runnable) was
+/// never scheduled because the vault client's input-wait yields kept
+/// self-picking. The self-switch fallback preserves the lease clock
+/// (ticks still bump when nothing else is runnable) without the halt
+/// that `schedule_from` would take.
 ///
 /// CEP: CEP-1 | Complete
 /// Cost: one context switch (or a self-switch: same cost class).
-/// Fail: cannot fail (the caller is Runnable by definition, so the scan
-///       always finds at least one target).
+/// Fail: cannot fail (the caller is Runnable by definition; the fallback
+///       guarantees a target).
 /// Assumes: called from a Runnable task; cooperative single-CPU.
 pub fn yield_tick(cur: usize) {
     let slots = tasks();
     let mut picked: Option<usize> = None;
-    for off in 0..MAX_TASKS {
+    for off in 1..MAX_TASKS {
         let i = (cur + off) % MAX_TASKS;
         if matches!(slots[i].state, TaskState::Runnable) {
             picked = Some(i);
             break;
         }
     }
+    if picked.is_none() {
+        // Self-switch fallback: caller is the only runnable task. Same
+        // context saved and restored (a no-op switch that bumps the tick).
+        picked = Some(cur);
+    }
     if let Some(next) = picked {
         unsafe { SCHED_CURSOR = (next + 1) % MAX_TASKS };
         switch_to_task(cur, next);
     } else {
-        // Unreachable: the caller is Runnable and `off` 0 includes it.
+        // Unreachable: the fallback always produces a target.
         crate::halt_forever()
     }
 }
 
 /// Mark the calling task dead and yield control forever.
+/// Session death (v0.7.0): the dead task's capability table is cleared and
+/// every live Permission-Tracker grant is recorded Revoked — authority
+/// cannot outlive its holder (mechanical, not conventional; Ident.thy).
 /// CEP: CEP-1 | Complete
 /// Fail: cannot fail; never returns.
 pub fn task_exit(cur: usize) -> ! {
     tasks()[cur].state = TaskState::Dead;
+    crate::identity::on_task_exit(cur);
+    crate::cap::clear_table(cur);
     schedule_from(cur);
     // Dead tasks are never resumed; this halt keeps the `!` type honest.
     crate::halt_forever()
