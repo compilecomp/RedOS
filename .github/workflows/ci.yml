@@ -57,25 +57,41 @@ jobs:
         with:
           path: ~/.isabelle
           key: isabelle2024-hol-v1
-      - name: Install Isabelle2024 (mirror fallback chain, fast-fail)
+      - name: Install Isabelle2024 (verified permanent URL + fallbacks)
         run: |
           set -e
-          # v0.6.0 postmortem: with unlimited per-mirror hangs the chain
-          # burned the whole 60-minute job timeout on one dead mirror and
-          # the proof job NEVER RAN (silent red). Every attempt is now
-          # hard-bounded so the next mirror actually gets tried.
+          # v0.7.0 postmortem: every previously listed mirror was dead or
+          # unreachable from GH runners (Cambridge only carries the latest
+          # release; unej.fr does not resolve; cit.tum.de 404s). The
+          # PERMANENT versioned-website path on in.tum.de serves 200 and
+          # is primary; the canonical dist path and its redirect target
+          # are fallbacks. Every attempt is hard-bounded.
           for u in \
+            "https://isabelle.in.tum.de/website-Isabelle2024/dist/Isabelle2024_linux.tar.gz" \
             "https://isabelle.in.tum.de/dist/Isabelle2024_linux.tar.gz" \
-            "https://dist.isabelle.cit.tum.de/dist/Isabelle2024_linux.tar.gz" \
-            "https://www.cl.cam.ac.uk/research/hvg/Isabelle/dist/Isabelle2024_linux.tar.gz" \
-            "https://mirror.unej.fr/isabelle-dist/Isabelle2024_linux.tar.gz"; do
+            "http://dists.isabelle.cit.tum.de/dist/Isabelle2024_linux.tar.gz?token=Isabelle"; do
             echo "trying $u"
-            if curl -fSL --connect-timeout 20 --max-time 420 -o /tmp/isabelle.tar.gz "$u"; then break; fi
+            if curl -fSL --connect-timeout 30 --max-time 900 -o /tmp/isabelle.tar.gz "$u"; then break; fi
             rm -f /tmp/isabelle.tar.gz
           done
-          test -s /tmp/isabelle.tar.gz
-          sudo mkdir -p /opt && sudo tar -xf /tmp/isabelle.tar.gz -C /opt
-          echo "/opt/Isabelle2024/bin" >> "$GITHUB_PATH"
+          if [ -s /tmp/isabelle.tar.gz ]; then
+            sudo mkdir -p /opt && sudo tar -xf /tmp/isabelle.tar.gz -C /opt
+            echo "/opt/Isabelle2024/bin" >> "$GITHUB_PATH"
+          else
+            echo "all mirrors failed — falling back to the Docker Hub image"
+            echo "ISABELLE_DOCKER=1" >> "$GITHUB_ENV"
+          fi
+      - name: Build RedOS proof sessions (native, or Docker fallback)
+        run: |
+          set -e
+          if [ "${ISABELLE_DOCKER:-0}" = "1" ]; then
+            docker run --rm -v "$GITHUB_WORKSPACE/proof:/work/proof" \
+              makarius/isabelle:Isabelle2024 bash -c \
+              'isabelle build -b HOL && isabelle build -v -D /work/proof'
+          else
+            isabelle build -b HOL
+            isabelle build -v -D proof/
+          fi
       - name: Build HOL image (skipped by cache on later runs)
         run: isabelle build -b HOL
       - name: Build RedOS proof sessions
