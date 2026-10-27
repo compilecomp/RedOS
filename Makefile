@@ -42,6 +42,7 @@ FAULTY_BASE   := 0x780000600000
 # Freestanding static user images: large code model (VAs far above 2
 # GiB), no PIE, W^X enforced by the linker script's PHDRS flags.
 USR_CFLAGS := -nostdlib -static -ffreestanding -fno-pic -fno-pie -mcmodel=large \
+              -Wl,--build-id=none \
               -fno-stack-protector -fcf-protection=none -O2 -Wall -Wextra \
               -Werror -Iusr
 

@@ -145,9 +145,14 @@ spirit; the ledger is reviewed at every quarterly push.
    (root, page) pair: `access_clean` requires every access's page to be
    un-dirty at its prefix. The noflush hazard is the NEGATIVE theorem
    (`noflush_switch_does_not_clean`): switches never discharge the
-   obligation; only `TInvalidate` does. The hardware's actual
-   tag-vs-flush semantics are under the model (invpcid type 2 in
-   pagemap.rs, verified by the QEMU revocation probes).
+   obligation; only `TInvalidate` does. The dirty set is modeled with a
+   sound subset direction only (order-sensitivity: an invalidate that
+   precedes its unmap leaves the page dirty). The hardware's actual
+   tag-vs-flush semantics are under the model (invpcid type 0 /
+   individual-address in pagemap.rs); the CI QEMU CPU has neither PCID
+   nor INVPCID, so the instruction path has NOT been executed by any
+   probe — the encoding was verified by hand against the SDM and the
+   type operand is a fixed constant input (review fix B4).
 21. **Glass page sets are page-granular and abstract.** The pane map is
    `nat ⇀ bool` with every stored value True; W^X at the pane level is
    by construction (`panes_read_only`), not by permission-bit modeling.

@@ -292,13 +292,18 @@ pub fn init() {
     let pf = redos_pf_stub as *const () as u64;
     let gp = redos_gp_stub as *const () as u64;
     let ud = redos_ud_stub as *const () as u64;
-    let halt = pf; // catch-all: an unexpected #PF is as fatal as anything
+    // Stub routing by FRAME SHAPE, not by fatality (review fix B3):
+    // vectors WITH an error code (8,10,11,12,13,14,17) land on stubs that
+    // read the frame as TrapFrame (err@16); vectors WITHOUT one take the
+    // #UD stub, which pushes a fake zero code so the frame matches. The
+    // v0.8.0 draft pointed the catch-all at the #PF stub — a ring-3
+    // #DE/#BP/#XM (no error code) then read RFLAGS as CS, missed the
+    // containment check, and HALTED THE KERNEL from a sandboxed task.
     for i in 0..IDT_ENTRIES {
         match i {
-            6 => set_gate(i, ud, cs),
-            13 => set_gate(i, gp, cs),
-            14 => set_gate(i, pf, cs),
-            _ => set_gate(i, halt, cs),
+            14 => set_gate(i, pf, cs),  // #PF: probe-aware handler
+            8 | 10 | 11 | 12 | 13 | 17 => set_gate(i, gp, cs), // err-code faults
+            _ => set_gate(i, ud, cs),   // no-error-code: fake-err pad + contain
         }
     }
     unsafe {

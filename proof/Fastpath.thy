@@ -173,8 +173,8 @@ text \<open>The staged-sender exclusion: while a sender is blocked on the
       never a silent overwrite.\<close>
 
 theorem f_second_sender_rejected:
-  "fblocked s \<Longrightarrow> snd (f_send p s) = FRejected"
-  by simp
+  "f_sane s \<Longrightarrow> fblocked s \<Longrightarrow> snd (f_send p s) = FRejected"
+  by (simp add: f_sane_def split: if_splits)
 
 theorem f_stage_exclusive:
   "fstaged s = None \<Longrightarrow> \<not> fblocked s \<Longrightarrow>
@@ -227,13 +227,18 @@ definition access_clean :: "tcmd list \<Rightarrow> bool" where
       TAccess r v \<Rightarrow> (r, v) \<notin> dirty (fold tstep (take i cs) t0)
     | _ \<Rightarrow> True)"
 
-text \<open>The dirty set is exactly the unmaps minus the invalidations --
-      the trace-level characterization everything else follows from.\<close>
+text \<open>The dirty set CONTAINS the set-difference of unmaps minus
+      invalidations. (Review fix B2: equality is FALSE -- the fold is
+      order-sensitive, and an invalidate that PRECEDES its unmap leaves
+      the page dirty, e.g. [TInvalidate r v, TUnmap r v]; the
+      set-difference formulation is order-blind. The subset direction is
+      what the safety statements below need, and it is all that is
+      true.)\<close>
 
-theorem dirty_characterization:
-  "dirty (fold tstep cs t0) =
-     {(r, v). TUnmap r v \<in> set cs} - {(r, v). TInvalidate r v \<in> set cs}"
-  by (induct cs rule: rev_induct) (simp_all add: t0_def)
+theorem dirty_sound_subset:
+  "{(r, v). TUnmap r v \<in> set cs} - {(r, v). TInvalidate r v \<in> set cs}
+     \<subseteq> dirty (fold tstep cs t0)"
+  by (induct cs rule: rev_induct) (auto simp add: t0_def)
 
 text \<open>THE PCID hazard: unmap, root switch, access -- WITHOUT the
       invalidation the access is NOT safe. The switch kept the stale
@@ -262,10 +267,19 @@ text \<open>Generality: a clean trace IMPLIES every access in it was
       invalidated_access_is_safe).\<close>
 
 theorem access_clean_implies_invalidated:
-  "access_clean (cs @ [TAccess r v]) \<Longrightarrow>
-     (r, v) \<notin> {(r, v). TUnmap r v \<in> set cs}
+  assumes ok: "access_clean (cs @ [TAccess r v])"
+  shows "(r, v) \<notin> {(r, v). TUnmap r v \<in> set cs}
               - {(r, v). TInvalidate r v \<in> set cs}"
-  by (simp add: access_clean_def dirty_characterization)
+proof (rule notI)
+  assume "(r, v) \<in> {(r, v). TUnmap r v \<in> set cs}
+              - {(r, v). TInvalidate r v \<in> set cs}"
+  then have dirty: "(r, v) \<in> dirty (fold tstep cs t0)"
+    using dirty_sound_subset by blast
+  have clean: "(r, v) \<notin> dirty (fold tstep (take (length cs) (cs @ [TAccess r v])) t0)"
+    using ok by (simp add: access_clean_def)
+  moreover have "take (length cs) (cs @ [TAccess r v]) = cs" by simp
+  ultimately show False by simp
+qed
 
 subsection \<open>Glass wall: the compositor's visibility set\<close>
 

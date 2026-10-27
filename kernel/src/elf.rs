@@ -148,8 +148,10 @@ fn validate(img: &[u8]) -> Result<(u64, u64, u64, u64), ElfError> {
     if phnum as usize > MAX_PHNUM {
         return Err(ElfError::TooManySegments);
     }
-    if phoff + phnum * PHDR_SIZE > img.len() as u64 {
-        return Err(ElfError::BadPhoff);
+    // checked: a hostile phoff must not wrap past the bound (review M5).
+    match phoff.checked_add(phnum * PHDR_SIZE) {
+        Some(end) if end <= img.len() as u64 => {}
+        _ => return Err(ElfError::BadPhoff),
     }
     Ok((phoff, phentsize, phnum, entry))
 }
@@ -205,6 +207,13 @@ pub fn load(
         // form catches a segment whose END runs off, not just its start).
         in_window(p_vaddr)?;
         in_window(p_vaddr + p_memsz - 1)?;
+        // Page congruence: the loader slices file bytes per 4 KiB page at
+        // (vaddr mod 4096) == 0 positions — an offset/vaddr residue
+        // mismatch would load bytes at wrong in-page offsets SILENTLY
+        // (review M6). Refuse instead.
+        if (p_vaddr & 0xFFF) != (p_offset & 0xFFF) {
+            return Err(ElfError::BadOffset);
+        }
 
         // W^X policy: X&&!W → RX; W&&!X → RW|NX; both → refuse.
         let x = p_flags & PF_X != 0;

@@ -60,19 +60,19 @@ pub const PRIV_ALT: u64 = 0x0000_7080_0000_0000;
 /// Compositor screen window (PML4[230]) — the compositor's composed
 /// output; NO app root ever maps it (the glass wall's other direction).
 pub const GLASS_SCREEN: u64 = 0x0000_7300_0000_0000;
-/// User code window (PML4[252]): ELF64 program images load here. User
+/// User code window (PML4[240]): ELF64 program images load here. User
 /// VAs live in dedicated PML4 slots so a validated range check is a
 /// TOP-LEVEL check — a crafted p_vaddr outside the window is refused
 /// before any walk (elf.rs).
 pub const USER_CODE_BASE: u64 = 0x0000_7800_0000_0000;
-/// User stack window (PML4[253]); task slot i's stack top is
+/// User stack window (PML4[248]); task slot i's stack top is
 /// `USER_STACK_BASE + i * USER_STACK_STRIDE` (16 KiB mapped, guard-banded
 /// by the unmapped VAs around it).
 pub const USER_STACK_BASE: u64 = 0x0000_7C00_0000_0000;
 pub const USER_STACK_STRIDE: u64 = 1 << 20;
 
-const PML4_USER_CODE: usize = (USER_CODE_BASE >> 39) as usize & 0x1FF; // 252
-const PML4_USER_STACK: usize = (USER_STACK_BASE >> 39) as usize & 0x1FF; // 253
+const PML4_USER_CODE: usize = (USER_CODE_BASE >> 39) as usize & 0x1FF; // 240
+const PML4_USER_STACK: usize = (USER_STACK_BASE >> 39) as usize & 0x1FF; // 248
 const _: () = assert!(PML4_USER_CODE != PML4_USER_STACK);
 const _: () = assert!(USER_STACK_BASE < 0x0000_8000_0000_0000);
 
@@ -311,10 +311,11 @@ pub fn alloc_pcid() -> u16 {
     }
 }
 
-/// INVPCID type 2: invalidate the translation of `vaddr` for `pcid`.
+/// INVPCID type 0 (individual-address): invalidate the translation of
+/// `vaddr` for `pcid` only.
 /// CEP: CEP-1 | Complete
 /// Cost: one instruction.
-/// Fail: cannot fail (type 2 is a fixed constant; the CPU enforces the
+/// Fail: cannot fail (type 0 is a fixed input; the CPU enforces the
 ///       descriptor's canonical checks for us).
 /// Assumes: safe regardless of PCID_ACTIVE — on an inactive system every
 ///          CR3 load flushes everything, so the extra invalidate is moot.
@@ -323,13 +324,18 @@ fn invpcid_addr(pcid: u16, vaddr: u64) {
     let desc: [u64; 2] = [(pcid as u64) | (vaddr & !0xFFF), 0];
     unsafe {
         core::arch::asm!(
-            // INVPCID type 2, descriptor at [rdx]: 66 0F 38 82 /r.
-            // (GAS refuses the `invpcid eax, [rdx]` spelling — the
-            // instruction's 66-prefixed encoding is emitted by hand,
-            // verified against objdump: 66 0f 38 82 02.)
+            // INVPCID (66 0F 38 82 /r): the TYPE travels in the modrm
+            // reg field (EAX here), the 128-bit descriptor at [rdx].
+            // (GAS refuses the `invpcid eax, [rdx]` spelling, so the
+            // 66-prefixed encoding is emitted by hand — verified against
+            // objdump: 66 0f 38 82 02.) Type 0 = individual-address.
+            // REVIEW FIX (v0.8.0): EAX was previously a clobber output —
+            // the type operand read uninitialized EAX (UB: a leftover
+            // value >= 4 faults with #UD on exactly the machines where
+            // PCID arms; 1-3 over-invalidate).
             ".byte 0x66, 0x0F, 0x38, 0x82, 0x02",
+            in("eax") 0u32,
             in("rdx") desc.as_ptr(),
-            out("eax") _,
             options(nostack)
         );
     }
@@ -338,7 +344,7 @@ fn invpcid_addr(pcid: u16, vaddr: u64) {
 /// Load CR3 with the root's PCID tag. noflush = keep the incoming root's
 /// cached translations (the optimization: a root switch becomes ~free).
 /// Revocation safety contract: EVERY unmap/reflag on a non-current root
-/// invalidates via invpcid (below), so noflush loads never resurrect a
+/// invalidates via invpcid type 0 (below), so noflush loads never resurrect a
 /// dead translation. pcid 0 / inactive PCID = plain CR3 load (full flush).
 /// CEP: CEP-1 | Complete
 /// Cost: one mov (flush) or one mov + the retained TLB (noflush).

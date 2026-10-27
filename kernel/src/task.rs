@@ -105,8 +105,9 @@ pub struct RecvReq {
     pub max_len: usize,
 }
 
-// Static task table: no heap in the kernel (Law 1). 6 tasks × 16 KiB = 96 KiB
-// of .bss — inside the 4 MiB load window enforced by linker.ld.
+// Static task table: no heap in the kernel (Law 1). 12 tasks x
+// 16 KiB = 192 KiB of .bss — inside the 4 MiB load window enforced by
+// linker.ld.
 static mut TASKS: [Task; MAX_TASKS] = [new_task(); MAX_TASKS];
 
 const fn new_task() -> Task {
@@ -308,7 +309,11 @@ pub fn spawn_user_in(idx: usize, rip: u64, rsp: u64, cap_arg: u64) -> usize {
     let task = &mut slots[idx];
     let base = task.stack.as_mut_ptr() as u64;
     let img_hi = base + STACK_SIZE as u64;
-    let kstack_top = img_hi; // 16 KiB-aligned: the syscall frame contract
+    // 16-BYTE alignment is the syscall entry stub's frame contract (the
+    // `call` in redos_syscall_entry needs rsp ≡ 0 mod 16). Enforced here
+    // rather than trusted to repr(Rust) field placement (review M3).
+    assert!(img_hi % 16 == 0, "spawn_user_in: kernel stack top misaligned");
+    let kstack_top = img_hi;
     let s = (img_hi - 48) & !0xF;
     unsafe {
         write_stack(s, user_trampoline as unsafe extern "C" fn() -> ! as u64);

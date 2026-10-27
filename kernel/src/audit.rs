@@ -35,7 +35,7 @@ pub const EXPORTED_SYMBOLS: [&str; 12] = [
                                 //  containment — no port I/O, no DMA
     "glass(compositor-ro)",     // v0.8.0: compositor with read-only panes;
                                 //  display path is RAM frames only
-    "pcid(invlpg-type2)",       // v0.8.0: PCID+INVPCID pair (TLB
+    "pcid(invpcid-type0)",       // v0.8.0: PCID+INVPCID pair (TLB
                                 //  invalidation obligation; full-flush
                                 //  baseline when the pair is absent)
 ];
