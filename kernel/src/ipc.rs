@@ -50,6 +50,15 @@ pub struct Endpoint {
     pub send_waiter: Option<usize>,
     /// Sender's staged message while blocked (mailbox full path).
     pub staged: Option<Message>,
+    // --- Register-path queues (v0.8.0 fast path; SEPARATE from the byte
+    // -- queues above — a byte receiver can never consume a register
+    // -- message and vice versa; see fastpath.rs).
+    /// A task parked in sys_recv (its frame pointer is in its Task).
+    pub frecv_waiter: Option<usize>,
+    /// A task blocked with registers staged (fast path, no receiver yet).
+    pub fsend_waiter: Option<usize>,
+    /// The staged register payload (opaque; the router never reads it).
+    pub fstaged: Option<crate::fastpath::Regs5>,
 }
 
 const fn new_endpoint() -> Endpoint {
@@ -59,6 +68,9 @@ const fn new_endpoint() -> Endpoint {
         recv_waiter: None,
         send_waiter: None,
         staged: None,
+        frecv_waiter: None,
+        fsend_waiter: None,
+        fstaged: None,
     }
 }
 

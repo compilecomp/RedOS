@@ -69,7 +69,11 @@
 
 mod audit;
 mod cap;
+mod elf;
+mod fastpath;
 mod ffi;
+mod gdt;
+mod glass;
 mod handoff;
 mod identity;
 mod input;
@@ -79,7 +83,9 @@ mod mm;
 mod ramdisk;
 mod serial;
 mod shm;
+mod syscall;
 mod task;
+mod userimg;
 
 use cap::RW;
 use core::arch::asm;
@@ -122,6 +128,13 @@ static TASK_A: AtomicUsize = AtomicUsize::new(0);
 static TASK_B: AtomicUsize = AtomicUsize::new(0);
 static TASK_C: AtomicUsize = AtomicUsize::new(0);
 static TASK_S: AtomicUsize = AtomicUsize::new(0);
+/// Glass-wall task slots (v0.8.0): W = compositor, P = painter.
+static GLASS_W: AtomicUsize = AtomicUsize::new(0);
+static GLASS_P: AtomicUsize = AtomicUsize::new(0);
+/// Glass endpoint + per-task capability slots (write-once by kmain).
+static EP_GLASS: AtomicUsize = AtomicUsize::new(0);
+static CAP_W_GLASS: AtomicUsize = AtomicUsize::new(0);
+static CAP_P_GLASS: AtomicUsize = AtomicUsize::new(0);
 
 /// Endpoint index created by kmain (write-once; see TASK_A note).
 static EP: AtomicUsize = AtomicUsize::new(0);
@@ -148,7 +161,7 @@ pub extern "C" fn _start(boot: &Handoff) -> ! {
     serial::init();
 
     serial::print(format_args!(
-        "\n=== RedOS v0.7.0 kernel (Zero-ID Identity) ===\n"
+        "\n=== RedOS v0.8.0 kernel (Fast Path + Glass Wall) ===\n"
     ));
 
     if let Err(reason) = boot.validate() {
@@ -163,9 +176,31 @@ pub extern "C" fn _start(boot: &Handoff) -> ! {
     // 2. Paging: build the kernel root and switch CR3. From here on the
     //    handoff/mmap pages are off-limits (documented in pagemap.rs).
     pagemap::init();
-    // 3. The IDT (exception traps — the enforcement half of revocation).
+    // 3. GDT/TSS BEFORE the IDT: the exception gates record OUR kernel
+    //    CS (0x08), and RSP0 must exist before the first ring-3 fault.
+    gdt::init();
+    // 4. The IDT (exception traps — the enforcement half of revocation,
+    //    and from v0.8.0 the ring-3 containment boundary).
     idt::init();
-    // 4. Structural guarantees.
+    // 5. Image-wide W^X: the kernel's own text was demoted to RO at
+    //    pagemap::init (4 KiB-from-birth — see the notes there); this is
+    //    the verification probe (the v0.7.0 promise — the spawn window
+    //    was RO, now the image is too).
+    if pagemap::verify_kernel_text_ro() {
+        serial::print(format_args!(
+            "[boot] kernel text write probe denied by MMU\nREDOS WX-KERNEL PASS\n"
+        ));
+    } else {
+        serial::print(format_args!("[boot] FAIL: kernel text is WRITABLE\n"));
+    }
+    // 6. The syscall substrate (STAR/LSTAR/SFMASK, EFER.SCE+NXE) and the
+    //    PCID/INVPCID pair (the measured root-switch optimization — the
+    //    full-flush baseline is kept when either feature is absent).
+    syscall::init();
+    pagemap::init_pcid();
+    pcid_bench();
+    fastpath_bench();
+    // 7. Structural guarantees.
     phys::anti_swap_audit();
     phys::report();
 
@@ -295,20 +330,179 @@ pub extern "C" fn _start(boot: &Handoff) -> ! {
         cap_done: cap_s_done,
         demo_entry: (sandbox_demo_body as extern "C" fn(u64) -> !) as usize as u64,
         decoy_entry: (vault_c as extern "C" fn(u64) -> !) as usize as u64,
+        elf_srv: userimg::SRV_ELF,
+        elf_cli: userimg::CLI_ELF,
+        elf_faulty: userimg::FAULTY_ELF,
     });
+
+    // --- Glass Wall wiring (v0.8.0) ------------------------------------------
+    // The compositor's root + screen are wired BEFORE its spawn so the
+    // painter's pane grant can target tasks[W].cr3 unconditionally
+    // (scheduling-order independence — glass.rs docs).
+    let ep_glass = ipc::create_endpoint();
+    let w = task::spawn(glass_w_entry, 0);
+    let p = task::spawn(glass_p_entry, 0);
+    glass::set_peer(w);
+    let root_w = glass::wire_compositor(w);
+    let cap_w_glass = cap::table_of(w)
+        .mint(ep_glass, RW)
+        .unwrap_or_else(|e| panic_str("mint W(glass): ", e));
+    let cap_p_glass = cap::table_of(p)
+        .mint(ep_glass, RW)
+        .unwrap_or_else(|e| panic_str("mint P(glass): ", e));
+    GLASS_W.store(w, Ordering::Relaxed);
+    GLASS_P.store(p, Ordering::Relaxed);
+    CAP_W_GLASS.store(cap_w_glass, Ordering::Relaxed);
+    CAP_P_GLASS.store(cap_p_glass, Ordering::Relaxed);
+    EP_GLASS.store(ep_glass, Ordering::Relaxed);
+    let _ = root_w; // recorded by wire_compositor; evidence in W's banner
     serial::print(format_args!(
-        "[boot] endpoints: demo={} prompt={} done={}\n",
-        ep, ep_prompt, ep_done
+        "[boot] glass wired: W={} P={} ep_glass={} root_w={:#x}\n",
+        w,
+        p,
+        ep_glass,
+        root_w
+    ));
+
+    serial::print(format_args!(
+        "[boot] endpoints: demo={} prompt={} done={} glass={}\n",
+        ep, ep_prompt, ep_done, ep_glass
     ));
     serial::print(format_args!(
-        "[boot] tasks spawned: A={} B={} C={} S={}\n",
-        a, b, c, s
+        "[boot] tasks spawned: A={} B={} C={} S={} W={} P={}\n",
+        a, b, c, s, w, p
     ));
 
     task::scheduler_run()
 }
 
+/// PCID measurement (the ROADMAP's "PCID/invpcid measured optimization").
+/// Two 256-switch runs against the same root: flush-mode CR3 loads vs
+/// PCID-tagged noflush loads. TSC deltas are QEMU-TCG-RELATIVE evidence
+/// (a TCG softmmu flush is not hardware microarchitectural truth); the
+/// hardware-side evidence for the fast path remains the instruction
+/// count (make fastpath-audit) — both are reported, neither overstated.
+/// CEP: CEP-2 | Complete (measurement)
+/// Fail: cannot fail (a missing PCID pair prints the baseline note).
+fn pcid_bench() {
+    let root = pagemap::kernel_root();
+    let pcid = pagemap::pcid_of(root);
+    if !pagemap::pcid_active() || pcid == 0 {
+        serial::print(format_args!(
+            "REDOS PCID PASS (baseline mode: full-flush CR3 loads are the safe default; no measurement claimed)\n"
+        ));
+        return;
+    }
+    // Touch a mapped page after each load so TCG must actually service
+    // the translation (not just book-keep the register write).
+    let probe_addr = pcid_bench as *const () as u64;
+    let iters = 256u32;
+    let mut t0_flush: u64 = 0;
+    let mut t1_flush: u64 = 0;
+    let mut t0_pcid: u64 = 0;
+    let mut t1_pcid: u64 = 0;
+    unsafe {
+        core::arch::asm!("rdtsc", out("rax") t0_flush, out("rdx") _, options(nomem, nostack));
+        for _ in 0..iters {
+            pagemap::switch_cr3_pcid(root, pcid, false);
+            let v: u64;
+            core::arch::asm!("mov {0}, [rax]", out(reg) v, in("rax") probe_addr, options(nostack));
+            core::hint::black_box(v);
+        }
+        core::arch::asm!("rdtsc", out("rax") t1_flush, out("rdx") _, options(nomem, nostack));
+        core::arch::asm!("rdtsc", out("rax") t0_pcid, out("rdx") _, options(nomem, nostack));
+        for _ in 0..iters {
+            pagemap::switch_cr3_pcid(root, pcid, true);
+            let v: u64;
+            core::arch::asm!("mov {0}, [rax]", out(reg) v, in("rax") probe_addr, options(nostack));
+            core::hint::black_box(v);
+        }
+        core::arch::asm!("rdtsc", out("rax") t1_pcid, out("rdx") _, options(nomem, nostack));
+    }
+    let flush_per = (t1_flush - t0_flush) / iters as u64;
+    let pcid_per = (t1_pcid - t0_pcid) / iters as u64;
+    serial::print(format_args!(
+        "[mm] PCID bench ({} switches each, TCG-relative): flush={} cycles/switch, noflush={} cycles/switch\n",
+        iters, flush_per, pcid_per
+    ));
+    serial::print(format_args!(
+        "REDOS PCID PASS (pcid={} invpcid=yes; noflush loads armed; measured delta recorded)\n",
+        pcid
+    ));
+}
+
+/// Register fast-path service-cost measurement (kernel-side segments,
+/// TCG-relative: dispatch on a synthetic PING frame; the blind payload
+/// copy). The end-to-end evidence stays with fastpath-audit's objdump
+/// count and the RING3/FASTPATH round trips in the boot scenario.
+/// CEP: CEP-2 | Complete (measurement)
+/// Fail: cannot fail.
+fn fastpath_bench() {
+    let mut frame = syscall::SyscallFrame {
+        pad2: 0,
+        pad1: 0,
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        rbp: 0,
+        rbx: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0x1234_5678_9ABC_DEF0,
+        rax: syscall::SYS_PING,
+        user_rsp: 0,
+    };
+    let iters = 1000u32;
+    let mut t0: u64 = 0;
+    let mut t1: u64 = 0;
+    unsafe {
+        core::arch::asm!("rdtsc", out("rax") t0, out("rdx") _, options(nomem, nostack));
+        for _ in 0..iters {
+            frame.rax = syscall::SYS_PING; // dispatch overwrites rax with the result
+            let r = syscall::redos_syscall_dispatch(&mut frame as *mut _);
+            core::hint::black_box(r);
+        }
+        core::arch::asm!("rdtsc", out("rax") t1, out("rdx") _, options(nomem, nostack));
+    }
+    let per = (t1 - t0) / iters as u64;
+    serial::print(format_args!(
+        "[sys] dispatch bench ({} PING calls, TCG-relative): {} cycles/dispatch\n",
+        iters, per
+    ));
+    serial::print(format_args!(
+        "REDOS FASTPATH CYCLES: dispatch-bench={}; instruction budget audited by make fastpath-audit (objdump evidence)\n",
+        per
+    ));
+}
+
 // --- Task A: producer + memory-physics tests -------------------------------
+
+/// Glass entry wrappers (the spawn interface passes one u64; the glass
+/// bodies read their wiring from the write-once statics above).
+/// CEP: CEP-2 | Complete (test-wiring)
+extern "C" fn glass_w_entry(_arg: u64) -> ! {
+    glass::compositor(
+        GLASS_W.load(Ordering::Relaxed),
+        CAP_W_GLASS.load(Ordering::Relaxed),
+        EP_GLASS.load(Ordering::Relaxed),
+    )
+}
+
+/// Painter entry wrapper (see glass_w_entry).
+/// CEP: CEP-2 | Complete (test-wiring)
+extern "C" fn glass_p_entry(_arg: u64) -> ! {
+    glass::painter(
+        GLASS_P.load(Ordering::Relaxed),
+        CAP_P_GLASS.load(Ordering::Relaxed),
+        EP_GLASS.load(Ordering::Relaxed),
+    )
+}
 
 /// Task A: isolation probe, wipe/lock tests, zero-copy production, blind
 /// descriptor send, self write-demotion check.

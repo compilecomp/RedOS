@@ -60,9 +60,17 @@ global_asm!(
     "    push rdi",
     "    mov rdi, rsp",          // arg1: &TrapFrame
     "    mov rsi, cr2",          // arg2: CR2
+    "    mov [{fcell}], rdi",    // stash the frame base: the handler is a
+                                 // normal C-ABI function and may clobber rdi
+                                 // (caller-saved). The v0.8.0 bring-up run
+                                 // hit this exactly: 'mov rsp, rdi' after
+                                 // the call loaded garbage and the fixup
+                                 // iretq'd from nowhere. A static cell is
+                                 // race-free here (one CPU, faults never
+                                 // nest — the handler contains or halts).
     "    and rsp, -16",          // SysV callee alignment
     "    call redos_pf_handler",
-    "    mov rsp, rdi",          // restore pre-call rsp (frame base)
+    "    mov rsp, [{fcell}]",    // restore pre-call rsp (frame base)
     "    pop rdi",
     "    pop rax",
     "    add rsp, 8",            // discard #PF error code
@@ -77,27 +85,61 @@ global_asm!(
     "    and rsp, -16",
     "    call redos_fault_halt",
     "1:  jmp 1b",
-    // #UD (6): no error code on stack.
+    // #UD (6): no error code on stack — push a FAKE zero code so the
+    // frame matches TrapFrame exactly (the v0.8.0 containment path reads
+    // frame.cs; without the pad it would read RFLAGS as CS).
     ".globl redos_ud_stub",
     "redos_ud_stub:",
     "    push rax",
     "    push rdi",
+    "    push 0",
     "    mov rdi, rsp",
     "    mov esi, 6",
     "    and rsp, -16",
     "    call redos_fault_halt",
     "1:  jmp 1b",
+    fcell = sym PF_FRAME_CELL,
 );
 
-/// Fail-fast handler for #GP/#UD (never returns). `_frame` is kept for
-/// future forensics; today the handler prints the vector and halts.
+/// Fail-fast handler for #GP/#UD — ring-0 faults halt; ring-3 faults are
+/// CONTAINED (v0.8.0): the faulting user task is killed, its session is
+/// revoked, and the scenario continues without it. A user task must never
+/// be able to halt the kernel.
+/// CEP: CEP-0-candidate | Complete
+/// Cost: O(1) + one switch on the containment path.
+/// Fail: ring-0 faults halt with forensics (fail-fast, unchanged).
 #[no_mangle]
-pub extern "C" fn redos_fault_halt(_frame: *mut TrapFrame, vector: u64) -> ! {
+pub extern "C" fn redos_fault_halt(frame: *mut TrapFrame, vector: u64) -> ! {
+    unsafe {
+        if (*frame).cs & 3 == 3 {
+            contain_user_fault(frame, vector, 0);
+        }
+    }
     serial::print(format_args!(
         "\nKERNEL FAULT: unexpected exception #{}\n",
         vector
     ));
     crate::halt_forever();
+}
+
+/// Ring-3 fault containment: name the fault, kill the task, schedule on.
+/// The user task's own problem never becomes the kernel's problem — the
+/// Glass-Wall/sandbox story in one function.
+/// CEP: CEP-0-candidate | Complete
+/// Cost: O(1) + one task_exit (schedule + switch).
+/// Fail: cannot fail (task_exit's schedule path halts if nothing is
+///       runnable — a named, visible end state, never a silent one).
+/// Assumes: called from a fault stub with the trap frame on RSP0; the
+///          faulting task is not slot 0 (kmain never enters ring 3).
+unsafe fn contain_user_fault(frame: *mut TrapFrame, vector: u64, cr2: u64) -> ! {
+    let f = &mut *frame;
+    let cur = crate::task::current();
+    serial::print(format_args!(
+        "[usr] task {} FAULT #{} at rip={:#x} cr2={:#x} (ring 3 — contained)\n",
+        cur, vector, f.rip, cr2
+    ));
+    crate::task::record_exit(cur, crate::task::EXIT_FAULT_MARKER);
+    crate::task::task_exit(cur); // Dead + revoke + schedule (never returns)
 }
 
 /// The trap frame as it lies on the stack when the Rust handler runs
@@ -113,6 +155,11 @@ pub struct TrapFrame {
     pub rsp: u64,
     pub ss: u64,
 }
+
+// The #PF stub's frame-base stash (see the stub's comment). Single CPU,
+// faults never nest: one cell is race-free.
+#[no_mangle]
+pub static mut PF_FRAME_CELL: u64 = 0;
 
 // --- Probe protocol state --------------------------------------------------
 
@@ -132,6 +179,12 @@ static mut ARMED: u32 = 0;
 pub extern "C" fn redos_pf_handler(frame: *mut TrapFrame, cr2: u64) {
     unsafe {
         let f = &mut *frame;
+        // Ring-3 faults are contained BEFORE anything else: the probe
+        // protocol is a ring-0 facility; user faults must never reach it
+        // (and could not race it — probes never cross a task switch).
+        if f.cs & 3 == 3 {
+            contain_user_fault(frame, 14, cr2);
+        }
         if ARMED == 1 && FIXUP != 0 && cr2 == EXPECTED {
             // Kill-switch semantics: drop the operation, resume at the
             // fixup with rax=1 ("faulted"). The app sees a generic denial.
@@ -305,9 +358,17 @@ pub fn probe_read(addr: u64) -> Option<u64> {
             "7:",                        // handler rewires RIP here (rax=1)
             "8:",
             lateout("rdi") _,            // scratch (M1: declared, not assumed)
-            in("rsi") addr_of_mut!(FIXUP),
+            // rsi/rcx/rdx are CLOBBERED outputs, not surviving inputs: on
+            // the fault path the #PF handler runs (iretq-resumed) and may
+            // trash every caller-saved register. Two probes inlined in
+            // sequence would otherwise inherit a clobbered register as
+            // the next block's input (observed v0.8.0: the second probe's
+            // FIXUP store faulted on a stale rsi). With inout => _ the
+            // compiler reloads each block's registers — the coalescing
+            // assumption is dead.
+            inout("rsi") addr_of_mut!(FIXUP) => _,
             out("rdx") val,
-            in("rcx") addr,
+            inout("rcx") addr => _,
             inout("rax") 0u64 => fault,
             options(nostack)
         );
@@ -339,9 +400,11 @@ pub fn probe_write(addr: u64, v: u64) -> bool {
             "7:",
             "8:",
             lateout("rdi") _,            // scratch (M1: declared, not assumed)
-            in("rsi") addr_of_mut!(FIXUP),
-            in("rcx") addr,
-            in("rdx") v,
+            // Same clobber discipline as probe_read (see its note): the
+            // handler trashes caller-saved regs on the fault path.
+            inout("rsi") addr_of_mut!(FIXUP) => _,
+            inout("rcx") addr => _,
+            inout("rdx") v => _,
             inout("rax") 0u64 => fault,
             options(nostack)
         );

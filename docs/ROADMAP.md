@@ -36,7 +36,7 @@ only the scope ceiling is lifted.
 | 25% | v0.5.0 | **Memory physics** (Pillar 2): 4-level paging + HHDM, per-task CR3 roots, Ephemeral Page Allocator (classification, wipe protocol, mlock mandate, anti-swap audit), IDT + #PF probe protocol, zero-copy shared memory with CNode kill switch (write-demotion on transfer, MMU-enforced revocation) | Six MEMPHY banners in QEMU: isolation, wipe, lock, zero-copy, revoke, complete; `Mem.thy` + `Revoke.thy` sorry-free |
 | 50% | v0.6.0 | **RAM-only KMS vault** (Pillar 2): Argon2id (RFC 9106, C core + KAT vectors), PIN → master key into Locked-class frames, XTS-encrypted RAM disk, lease expiry, duress counter / dead-man's wipe | KMS KATs pass; encrypted RAM-disk round-trip in QEMU; wrong-PIN counter destroys the vault (fail-closed) — **DELIVERED** |
 | 75% | v0.7.0 | **Zero-ID identity** (Pillar 1): manifest schema (binary hash, sandbox profile, requested capabilities, lease terms), sandbox spawner, default grants, runtime prompt handshake | Spawner refuses hash mismatch; prompt grants session/lease-scoped caps, tracked by the Permission Tracker — **DELIVERED** |
-| 100% | v0.8.0 | **IPC fast-path + Glass Wall** (Pillar 2/5): `syscall`/`sysret` ring transition, rendezvous register path, PCID/invpcid measured optimization, compositor read-only pixel buffers | Fast-path IPC under 100-cycle budget with disassembly evidence; compositor cannot read app memory (MMU-proven) |
+| 100% | v0.8.0 | **IPC fast-path + Glass Wall** (Pillar 2/5): `syscall`/`sysret` ring transition, rendezvous register path, PCID/invpcid measured optimization, compositor read-only pixel buffers | Fast-path IPC under 100-cycle budget with disassembly evidence; compositor cannot read app memory (MMU-proven) — **DELIVERED** |
 
 **v0.5.0 delivered (this push).** Kernel-side memory physics is real:
 the allocator classifies every frame (General/Locked/Shared/Reserved),
@@ -157,6 +157,62 @@ and `proof/Kms.thy` extensions (entropy policy decision table, the
 terminal Refused state with its own reachability invariant). Zero
 `sorry`; model simplifications recorded in `proof/TODO.md` (items
 14-18).
+
+**v0.8.0 delivered (this push).** Phase 2 closes with the IPC fast
+path and the Glass Wall:
+
+* **Ring 3, for real.** GDT/TSS substrate (kernel 0x08/0x10, user
+  0x18/0x20, TSS.RSP0 for ring-3 faults — packed TSS layout, the same
+  class of trap as the v0.5.0 IDTR), `syscall`/`sysret` via
+  STAR/LSTAR/SFMASK (SFMASK strips TF/IF/DF/IOPL/NT/AC), EFER.SCE+NXE.
+  The syscall frame carries **user_rsp**: SYSRET restores RIP and
+  RFLAGS but NOT RSP — the frame's 18-push layout (compile-time offset
+  asserts) is the ABI that keeps user stacks user's.
+* **ELF64 user binaries.** Static ET_EXEC images built from `usr/`
+  (crt0 + fixed 2 MiB slots inside the user code window, PML4[240]),
+  W^X segments enforced by the loader (text R+X, rodata R, data RW|NX;
+  a W+X segment is a named refusal), per-slot stack windows. Spawned
+  through the SAME manifest path (MAC over the whole image hash first,
+  then profile) with exactly one default grant in RDI.
+* **Register fast path.** `SYS_IPC_SEND`/`RECV`: five opaque payload
+  registers + one capability slot; direct delivery into the parked
+  receiver's saved frame and a DIRECT context switch (no scheduler
+  scan, no mailbox hop). Blindness: the router moves `[u64; 5]`
+  verbatim; the round-trip verification lives in the USER PROGRAMS
+  (srv verifies its own protocol constants — the kernel never sees
+  them). Slow paths (stage+block) are out-of-line cold helpers.
+* **Measured optimization, honestly.** PCID+INVPCID enabled only as a
+  pair (noflush CR3 loads are revocation-safe only when stale entries
+  can be invalidated precisely — invpcid type 2 per (root, page)); TSC
+  deltas reported as QEMU-TCG-relative; the 100-cycle-per-hop budget's
+  hard evidence is `make fastpath-audit` — objdump-counted instructions
+  over exact symbol sizes: entry stub 47 + dispatch 56 + send 84 +
+  recv 75 + switch 15 = **277 whole-rendezvous, ceiling 300**, failing
+  the build if regressed.
+* **Glass Wall.** The painter owns its surface (RW); the compositor
+  gets a read-only pane (`shm::share_ro`) and composes into its own
+  private screen. MMU-proven in both directions: pane writes denied,
+  app-private reads denied to the compositor, screen reads denied to
+  the app. `Fastpath.thy`: the pane set grows only through grants, so
+  no app-private page is ever admitted.
+* **Fault containment.** Ring-3 #PF/#GP/#UD kill the faulting task
+  (marker exit, session revoked) and nothing else — demonstrated by
+  faulty.elf while srv/cli had already exited cleanly.
+* **Image-wide W^X.** The kernel-image leaf is built as 4 KiB pages at
+  boot with the text RO from the FIRST walk (the v0.7.0 promise).
+  Bring-up forensics worth their own note: the v0.5.0 low-identity map
+  pointed PML4[0] straight at a table of 2 MiB entries — read as a
+  PDPT, whose PS bit means 1 GiB — so the low map had been ONE giant
+  RW 1 GiB page since v0.5.0 (working by accident; the text could
+  never be protected). The PDPT level is now explicit, and the W^X
+  probe plus the ring-3 containment banners prove it.
+
+Formal specs added at v0.8.0: `proof/Fastpath.thy` (control-blindness
+of the register path, exactly-once delivery + the sane-endpoint
+invariant, the TLB invalidation obligation with the noflush hazard as
+a negative theorem, glass-wall pane provenance/revocation, containment
+scope). Zero `sorry`; model simplifications recorded in
+`proof/TODO.md` (items 19-23).
 
 **CI repairs (review-gate finds, v0.7.0 closes).** The independent
 review surfaced two latent failures the local sandbox could never see:

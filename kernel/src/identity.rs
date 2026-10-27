@@ -495,6 +495,12 @@ pub struct Config {
     /// the hash-refusal scenario (manifest vouches for decoy content,
     /// spawner is handed the real entry: mismatch must refuse).
     pub decoy_entry: u64,
+    /// Embedded ELF user programs (v0.8.0): the fast-path server, the
+    /// fast-path client, and the intentional-fault containment demo.
+    /// Built by the Makefile from usr/ and embedded via include_bytes!.
+    pub elf_srv: &'static [u8],
+    pub elf_cli: &'static [u8],
+    pub elf_faulty: &'static [u8],
 }
 
 static mut CFG: Option<Config> = None;
@@ -536,6 +542,101 @@ fn cfg() -> Config {
 /// Cost: one load. Fail: cannot fail.
 pub fn sandbox_task() -> usize {
     TASK_D.load(Ordering::Relaxed)
+}
+
+/// Spawn a RING-3 user task from an ELF image under an operator-vouched
+/// manifest (v0.8.0). The manifest's content hash binds the WHOLE ELF
+/// image (BLAKE2b-256 over the bytes — the same refusal order as
+/// spawn_from_manifest: MAC first, then hash, then profile). The loader
+/// (elf.rs) maps W^X segments inside the code window and a private
+/// stack; the default grant is the SAME as the kernel-function spawn:
+/// exactly one capability — SEND/RECV on the prompt/fast endpoint —
+/// recorded BEFORE the cap exists, delivered to the program in RDI.
+///
+/// Refusal inertness: verification refusals (MAC/hash/profile/ELF) touch
+/// nothing; resource refusals leave wiped-or-parked frames only.
+///
+/// CEP: CEP-1 | Complete
+/// Cost: one BLAKE2b (MAC) + one BLAKE2b (hash) + loader maps + 1 mint.
+/// Fail: named SpawnError / ElfError (the caller prints refusals).
+pub fn spawn_elf_from_manifest(
+    img: &'static [u8],
+    m: &Manifest,
+    code_base: u64,
+) -> Result<usize, SpawnError> {
+    // 1. MAC under the vault key (fail-closed on a closed vault).
+    let mut key = kms::manifest_key().map_err(|_| SpawnError::VaultClosed)?;
+    let mut prefix = [0u8; PREFIX_LEN];
+    m.encode_prefix(&mut prefix);
+    let mut mac = [0u8; MAC_LEN];
+    let mac_rc = ffi::blake2b(&mut mac, &prefix, &key);
+    scrub(&mut key);
+    mac_rc.map_err(SpawnError::Crypto)?;
+    let mut diff = 0u8;
+    for i in 0..MAC_LEN {
+        diff |= mac[i] ^ m.mac[i];
+    }
+    if diff != 0 {
+        return Err(SpawnError::MacMismatch);
+    }
+
+    // 2. Content binding over the WHOLE image (no entry-addr prefix:
+    //    the loader resolves the entry from the validated ELF header).
+    let mut hash = [0u8; 32];
+    ffi::blake2b(&mut hash, img, &[]).map_err(SpawnError::Crypto)?;
+    if hash != m.binary_hash {
+        return Err(SpawnError::HashMismatch);
+    }
+
+    // 3. Profile validity.
+    if m.profile != PROFILE_STD && m.profile != PROFILE_STRICT {
+        return Err(SpawnError::Profile);
+    }
+
+    // 4. Load (W^X segments, validated window, private stack).
+    let root = pagemap::new_task_root().map_err(|_| SpawnError::Paging)?;
+    let slot_hint = 0; // stack address uses the task slot, resolved below
+    let _ = slot_hint;
+    // Resolve the task slot FIRST so the stack window can be slot-scoped.
+    let idx = match task::free_slot() {
+        Some(i) => i,
+        None => return Err(SpawnError::Paging),
+    };
+    let stack_top = pagemap::USER_STACK_BASE + (idx as u64) * pagemap::USER_STACK_STRIDE;
+    let (rip, rsp) = crate::elf::load(root, img, code_base, stack_top, 4)
+        .map_err(|e| {
+            e.print();
+            SpawnError::BadEntry
+        })?;
+
+    // 5. Default grant: RECORD FIRST, then mint (no cap without record).
+    append_record(Record {
+        task: idx,
+        auth: AUTH_PROMPT,
+        scope: Scope::Session,
+        decision: Decision::Granted,
+        at_tick: task::ticks(),
+        note: "default-grant-elf",
+    });
+    let ep = cfg().ep_prompt;
+    let cap_slot = cap::table_of(idx)
+        .mint(ep, RW)
+        .map_err(SpawnError::DefaultGrant)?;
+
+    // 6. Materialize the task (slot idx is now reserved for this image).
+    let d = task::spawn_user_in(idx, rip, rsp, cap_slot as u64);
+    task::tasks()[d].cr3 = root;
+    task::tasks()[d].pcid = pagemap::pcid_of(root);
+
+    serial::print(format_args!(
+        "[S] ELF spawn: slot {}, root {:#x}, rip {:#x}, cap slot {} (rdi), pcid {}\n",
+        d,
+        root,
+        rip,
+        cap_slot,
+        task::tasks()[d].pcid
+    ));
+    Ok(d)
 }
 
 /// The sandbox's prompt-endpoint capability slot (the default grant).
@@ -864,12 +965,159 @@ fn audit_and_complete(me: usize) -> ! {
             "",
         );
     }
+
+    // --- v0.8.0: ELF ring-3 spawn + register fast path + containment ----
+    elf_fastpath_scenario(me);
+
     // Completion signal to C (unblocks the duress phase of the scenario).
     let done = [b'D'];
     send(me, cfg().ep_done, cfg().cap_done, &done);
     serial::print(format_args!("REDOS IDNT TEST COMPLETE\n"));
     serial::print(format_args!("[S] done\n"));
     task::task_exit(me)
+}
+
+/// The v0.8.0 ELF scenario: three manifests (fast-path server, client,
+/// fault demo), three ring-3 spawns, the register rendezvous round trip
+/// verified BY THE USER PROGRAMS (the kernel never sees the payload
+/// values), and contained fault containment. Banners:
+///   REDOS RING3 PASS    — both user programs pinged through the
+///                         syscall/sysret round trip and exited 0
+///   REDOS FASTPATH PASS — the rendezvous delivered registers verified
+///                         by srv itself; exactly-once delivery held
+///   REDOS USRFAULT PASS — faulty's ring-3 #PF was contained; srv/cli
+///                         were unaffected (they exited before it ran)
+/// CEP: CEP-1 | Complete
+/// Cost: 3 spawns + a poll loop (cooperative yields) + one delivery.
+/// Fail: FAIL lines / named panics (scenario discipline).
+fn elf_fastpath_scenario(me: usize) {
+    use pagemap::USER_CODE_BASE;
+    // Link bases (usr/Makefile fragment + usr/link.ld --defsym): one
+    // 2 MiB slot per program inside the user code window (PML4[252]).
+    const SRV_BASE: u64 = USER_CODE_BASE + 0x20_0000;
+    const CLI_BASE: u64 = USER_CODE_BASE + 0x40_0000;
+    const FAULTY_BASE: u64 = USER_CODE_BASE + 0x60_0000;
+
+    let mk_manifest = |img: &'static [u8]| -> Manifest {
+        let mut h = [0u8; 32];
+        ffi::blake2b(&mut h, img, &[]).unwrap_or_else(|e| panic_str("manifest hash: ", e));
+        let mut m = Manifest {
+            profile: PROFILE_STRICT,
+            req_lease: false,
+            req_disk: false,
+            lease_ttl: 0,
+            binary_hash: h,
+            entry: 0, // ELF: the loader resolves from the validated header
+            mac: [0; MAC_LEN],
+        };
+        m.sign();
+        m
+    };
+
+    // 1. Spawn the server (it pings, then parks in a register recv).
+    let srv = match spawn_elf_from_manifest(cfg().elf_srv, &mk_manifest(cfg().elf_srv), SRV_BASE) {
+        Ok(s) => s,
+        Err(e) => panic_str("identity: srv spawn refused: ", spawn_dbg(&e)),
+    };
+    // 2. Spawn the client (it pings, then sends the register payload).
+    let cli = match spawn_elf_from_manifest(cfg().elf_cli, &mk_manifest(cfg().elf_cli), CLI_BASE) {
+        Ok(s) => s,
+        Err(e) => panic_str("identity: cli spawn refused: ", spawn_dbg(&e)),
+    };
+    serial::print(format_args!(
+        "[S] ring-3 spawns: srv={} cli={} (default grant: one fast-endpoint cap in RDI)\n",
+        srv, cli
+    ));
+
+    // 3. Poll to completion (cooperative: ticks advance for everyone).
+    let mut spins = 0u32;
+    loop {
+        let ts = task::tasks();
+        let srv_dead = matches!(ts[srv].state, task::TaskState::Dead);
+        let cli_dead = matches!(ts[cli].state, task::TaskState::Dead);
+        if srv_dead && cli_dead {
+            break;
+        }
+        spins += 1;
+        if spins > 100_000 {
+            panic_str("identity: fast-path scenario stuck (no completion)", "");
+        }
+        task::yield_tick(me);
+    }
+    let srv_code = task::EXIT_CODE[srv].load(Ordering::Relaxed);
+    let cli_code = task::EXIT_CODE[cli].load(Ordering::Relaxed);
+    serial::print(format_args!(
+        "[S] user exits: srv={} cli={} (0 = ping + payload verified by the program itself)\n",
+        srv_code, cli_code
+    ));
+    if srv_code == 0 && cli_code == 0 {
+        serial::print(format_args!(
+            "[S] ring-3 round trips verified by the programs (kernel payload-blind throughout)\nREDOS RING3 PASS\n"
+        ));
+    } else {
+        serial::print(format_args!(
+            "[S] FAIL: user exit codes nonzero (srv={} cli={})\n",
+            srv_code, cli_code
+        ));
+    }
+    if crate::fastpath::deliver_count() == 1 {
+        serial::print(format_args!(
+            "[S] register rendezvous: exactly-once delivery held (deliver_count=1)\nREDOS FASTPATH PASS\n"
+        ));
+    } else {
+        serial::print(format_args!(
+            "[S] FAIL: delivery count {} != 1\n",
+            crate::fastpath::deliver_count()
+        ));
+    }
+
+    // 4. The containment demo: faulty dereferences an unmapped VA in
+    //    ring 3 — the kernel contains the #PF and keeps running.
+    let faulty = match spawn_elf_from_manifest(
+        cfg().elf_faulty,
+        &mk_manifest(cfg().elf_faulty),
+        FAULTY_BASE,
+    ) {
+        Ok(s) => s,
+        Err(e) => panic_str("identity: faulty spawn refused: ", spawn_dbg(&e)),
+    };
+    let mut spins2 = 0u32;
+    loop {
+        if matches!(task::tasks()[faulty].state, task::TaskState::Dead) {
+            break;
+        }
+        spins2 += 1;
+        if spins2 > 100_000 {
+            panic_str("identity: faulty scenario stuck", "");
+        }
+        task::yield_tick(me);
+    }
+    let fcode = task::EXIT_CODE[faulty].load(Ordering::Relaxed);
+    if fcode == task::EXIT_FAULT_MARKER {
+        serial::print(format_args!(
+            "[S] fault contained: faulty killed by the kernel, scenario unaffected\nREDOS USRFAULT PASS\n"
+        ));
+    } else {
+        serial::print(format_args!(
+            "[S] FAIL: faulty exit {:#x} != FAULT_MARKER\n",
+            fcode
+        ));
+    }
+}
+
+/// SpawnError debug name (refusals print verbatim; no Debug derive on
+/// the type keeps the enum's surface explicit).
+fn spawn_dbg(e: &SpawnError) -> &'static str {
+    match e {
+        SpawnError::VaultClosed => "VaultClosed",
+        SpawnError::MacMismatch => "MacMismatch",
+        SpawnError::BadEntry => "BadEntry",
+        SpawnError::HashMismatch => "HashMismatch",
+        SpawnError::Profile => "Profile",
+        SpawnError::Paging => "Paging",
+        SpawnError::DefaultGrant(_) => "DefaultGrant",
+        SpawnError::Crypto(_) => "Crypto",
+    }
 }
 
 // --- IPC helpers (S's own table; same delivered-flag dance as main.rs) -------

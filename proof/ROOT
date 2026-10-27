@@ -6,3 +6,4 @@ session RedOS_Proofs = HOL +
     Revoke
     Kms
     Ident
+    Fastpath

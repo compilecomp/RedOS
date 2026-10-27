@@ -117,12 +117,20 @@ if grep -q "REDOS MEMPHY ISOLATION PASS" "$LOG" \
    && grep -q "REDOS IDNT PROMPT-DENIED PASS" "$LOG" \
    && grep -q "REDOS IDNT TRACKER PASS" "$LOG" \
    && grep -q "REDOS IDNT TEST COMPLETE" "$LOG" \
+   && grep -q "REDOS GDT-TSS PASS" "$LOG" \
+   && grep -q "REDOS WX-KERNEL PASS" "$LOG" \
+   && grep -q "REDOS PCID PASS" "$LOG" \
+   && grep -q "REDOS FASTPATH CYCLES" "$LOG" \
+   && grep -q "REDOS RING3 PASS" "$LOG" \
+   && grep -q "REDOS FASTPATH PASS" "$LOG" \
+   && grep -q "REDOS USRFAULT PASS" "$LOG" \
+   && grep -q "REDOS GLASSWALL PASS" "$LOG" \
    && grep -q "REDOS-BOOT" "$LOG" \
    && ! grep -q "FAIL:" "$LOG" \
    && ! grep -q "KERNEL PANIC" "$LOG" \
    && ! grep -q "KERNEL FAULT" "$LOG"; then
-    echo "BOOT TEST PASSED (memory-physics + KMS vault + zero-ID identity banners verified)"
-    grep -aE "REDOS-BOOT|MEMPHY|KMS|IDNT|RNG-POLICY|INPUT PASS|disk" "$LOG" | head -30
+    echo "BOOT TEST PASSED (memory-physics + KMS vault + zero-ID identity + fast-path/glass-wall banners verified)"
+    grep -aE "REDOS-BOOT|MEMPHY|KMS|IDNT|RNG-POLICY|INPUT PASS|disk|GDT|WX|PCID|RING3|FASTPATH|USRFAULT|GLASSWALL" "$LOG" | head -40
     exit 0
 fi
 

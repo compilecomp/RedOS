@@ -131,3 +131,34 @@ spirit; the ledger is reviewed at every quarterly push.
   policy cap, operator-denial neutrality, expiry/exit clearance).
 - Runtime request protocol: multi-task concurrent request queues (the
   one-sandbox model covers v0.7.0's single sandbox slot).
+
+## v0.8.0 model simplifications (Fastpath.thy)
+
+19. **Payloads are opaque values.** The register payload is `'p` (five
+   abstract words); the kernel-side copy is the identity on values. The
+   blindness theorem is stated over the CONTROL projection (parked /
+   staged-occupancy / blocked + result code): the staged path DOES store
+   the payload in the stage slot (as the byte router stores a staged
+   message), so naive state-blindness is false by construction; what is
+   proven is that no control decision reads a payload word.
+20. **PCID tags are abstract.** The TLB obligation is stated per
+   (root, page) pair: `access_clean` requires every access's page to be
+   un-dirty at its prefix. The noflush hazard is the NEGATIVE theorem
+   (`noflush_switch_does_not_clean`): switches never discharge the
+   obligation; only `TInvalidate` does. The hardware's actual
+   tag-vs-flush semantics are under the model (invpcid type 2 in
+   pagemap.rs, verified by the QEMU revocation probes).
+21. **Glass page sets are page-granular and abstract.** The pane map is
+   `nat ⇀ bool` with every stored value True; W^X at the pane level is
+   by construction (`panes_read_only`), not by permission-bit modeling.
+   The app-private set is a parameter: the theorem says no page OUTSIDE
+   the grant stream is ever admitted — that grants name only the surface
+   block is a scenario property (glass.rs), not a kernel invariant.
+22. **Ring-3 containment is modeled as a scoped state update.** The
+   marker exit code and the capability-table clearing live in
+   Ident.thy's session-death machinery; here only the scope property
+   (victim dies, others untouched) is restated.
+23. **Syscall frames are abstract.** The user_rsp save/restore (SYSRET
+   does not restore RSP) is a code-level ABI contract, enforced by the
+   compile-time offset asserts in syscall.rs and the RING3 round trip —
+   not modeled here.

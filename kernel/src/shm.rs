@@ -214,3 +214,41 @@ pub fn phys_of(id: usize) -> Result<u64, &'static str> {
 fn blocks() -> &'static mut [Option<Block>; MAX_BLOCKS] {
     unsafe { &mut *core::ptr::addr_of_mut!(BLOCKS) }
 }
+
+/// Glass-wall share (v0.8.0): map block `id` READ-ONLY into `viewer_root`
+/// and mint a READ-only capability into the viewer's table. Unlike
+/// `transfer`, the OWNER's mapping is untouched (it keeps drawing into
+/// its window); the viewer gets glass — a read-only pane — and nothing
+/// else. The `mapped_in` single-viewer note of `map_for` is deliberately
+/// not consulted: two roots legitimately hold views of one block with
+/// different permissions (owner RW, viewer RO) — that IS the glass wall.
+///
+/// CEP: CEP-1 | Complete
+/// Cost: O(pages) PTE writes + one mint.
+/// Fail: named errors (unknown/revoked block, mint exhaustion, PTE
+///       conflicts). The mint is rolled back if the mapping fails.
+pub fn share_ro(
+    viewer_root: u64,
+    viewer_caps: &mut crate::cap::CTable,
+    id: usize,
+) -> Result<usize, &'static str> {
+    let (phys, pages) = {
+        let b = blocks()[id]
+            .as_ref()
+            .ok_or("shm: share of unknown block")?;
+        if b.revoked {
+            return Err("shm: block revoked — no kernel path may map it again");
+        }
+        (b.phys, b.pages)
+    };
+    // Mint FIRST (rollback on map failure), then map read-only.
+    let slot = viewer_caps.mint_shm(id, crate::cap::READ)?;
+    let base = vaddr_of(id);
+    for p in 0..pages {
+        if let Err(e) = pagemap::map_page(viewer_root, base + (p as u64) * PAGE_SIZE, phys + (p as u64) * PAGE_SIZE, false) {
+            viewer_caps.revoke(slot);
+            return Err(e);
+        }
+    }
+    Ok(slot)
+}

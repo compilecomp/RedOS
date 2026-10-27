@@ -1,18 +1,16 @@
 //! RedOS kernel — tasks, context switch, cooperative scheduler.
 //!
-//! Phase 2 model (documented scope): tasks are ring-0 kernel threads with
-//! isolated stacks AND isolated address-space roots — each task carries a
-//! `cr3` physical root loaded at every switch (full TLB flush: the
-//! revocation-safe baseline, see mm/mod.rs). Private windows and
-//! per-task-permission shared windows live in these roots (mm/pagemap.rs).
-//! Preemptive scheduling and the ring-3 user/supervisor split arrive with
-//! the IPC fast-path milestone; the capability model does not depend on
-//! either.
+//! Phase 2 model: tasks carry isolated stacks AND isolated address-space
+//! roots — each task carries a `cr3` physical root loaded at every switch.
+//! v0.8.0 adds the ring-3 user task: a task spawned with a user entry
+//! (rip/rsp) runs through the `user_trampoline` (iretq into ring 3); its
+//! kernel interactions are exclusively syscalls (syscall.rs). `CURRENT`
+//! tracks the running slot for the fault-containment path, `EXIT_CODE`
+//! records user exit statuses for the scenario layer, and `direct_switch`
+//! is the rendezvous primitive behind the register fast path.
 //!
-//! CEP: CEP-0-candidate | Complete (Phase 2 scope)
-//! (The switch path keeps its CEP-0 candidacy: disassembly + cycle
-//! measurement deferred to the fast-path milestone, where the switch is
-//! rewritten with PCID — a measurement now would be thrown away.)
+//! CEP: CEP-0-candidate | Complete (switch_to is the measured switch; the
+//!       PCID noflush load makes the CR3 reload ~free — see fastpath-audit)
 //! Cost: switch_to is fixed ~15 instructions + one CR3 load; the scheduler
 //!       scan is O(MAX_TASKS).
 //! Fail: no-runnable-task and double-block conditions halt via panic
@@ -22,8 +20,9 @@
 
 use crate::serial;
 use core::arch::naked_asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const MAX_TASKS: usize = 6;
+pub const MAX_TASKS: usize = 12;
 pub const STACK_SIZE: usize = 16 * 1024;
 
 /// Callee-saved register image. Offsets MUST match `switch_to`:
@@ -59,7 +58,11 @@ pub enum TaskState {
     BlockedRecv(usize),
     /// Waiting to deposit a message into a full mailbox.
     BlockedSend(usize),
-    /// Finished; slot retained (no reuse in Phase 1).
+    /// Parked in a register-path recv (frame pointer in `kframe`).
+    BlockedRecvFast(usize),
+    /// Blocked with registers staged (register path, no receiver yet).
+    BlockedSendFast(usize),
+    /// Finished; slot retained (no reuse in Phase 2).
     Dead,
 }
 
@@ -82,9 +85,14 @@ pub struct Task {
     pub delivered: bool,
     /// Physical CR3 root for this task's address space (mm/pagemap.rs).
     /// 0 = still running on the kernel root (the spawn default). Loaded at
-    /// every context switch; a full TLB flush accompanies each load (no
-    /// PCID in Phase 2 — the revocation-safe baseline).
+    /// every context switch (PCID-tagged, noflush when the pair is live).
     pub cr3: u64,
+    /// This root's PCID tag (0 = flush-mode load; pagemap.pcid_of is the
+    /// authoritative map — this field is the per-task fast copy).
+    pub pcid: u16,
+    /// Parked syscall frame pointer while BlockedRecvFast (0 = none).
+    /// Written by fastpath::sys_recv, consumed by deliver_fast.
+    pub kframe: u64,
     // Align the stack so the image top can satisfy the SysV 16-byte
     // convention (task entry must see rsp ≡ 8 (mod 16)).
     _align: [u64; 0],
@@ -118,12 +126,46 @@ const fn new_task() -> Task {
         recv_len: 0,
         delivered: false,
         cr3: 0,
+        pcid: 0,
+        kframe: 0,
         _align: [],
     }
 }
 
 // Scheduler cursor (round-robin scan start).
 static mut SCHED_CURSOR: usize = 0;
+
+/// The currently-running task slot (0 = kmain until the first switch).
+/// Maintained by every switch path; the fault-containment handler reads
+/// it to name and kill the faulting user task.
+static mut CURRENT: usize = 0;
+
+/// The current task slot.
+/// CEP: CEP-1 | Complete
+/// Cost: one load. Fail: cannot fail.
+pub fn current() -> usize {
+    unsafe { CURRENT }
+}
+
+/// Per-task user exit codes (SYS_EXIT writes; the scenario layer reads).
+/// 0 = clean; nonzero = program-defined; the containment path records
+/// EXIT_FAULT_MARKER for contained ring-3 faults.
+pub static EXIT_CODE: [AtomicU64; MAX_TASKS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; MAX_TASKS]
+};
+
+/// The exit status recorded when a ring-3 task is killed by a contained
+/// fault (bit-patterned so it cannot collide with a small program code).
+pub const EXIT_FAULT_MARKER: u64 = 0xFA11_0000_0000_0001;
+
+/// Record a task's exit code (SYS_EXIT / containment path).
+/// CEP: CEP-1 | Complete
+/// Cost: one store. Fail: cannot fail (index is kernel-internal).
+pub fn record_exit(task: usize, code: u64) {
+    EXIT_CODE[task].store(code, Ordering::Relaxed);
+}
 
 /// Monotone scheduler tick: one bump per context switch. This is the ONLY
 /// clock the KMS vault gets (no timer interrupt exists in Phase 2 —
@@ -154,6 +196,7 @@ pub fn ticks() -> u64 {
 /// pushes a real return address; on resume the `ret` lands back inside
 /// `switch_to_task`, mid-call, exactly as the resume semantics require.
 #[unsafe(naked)]
+#[no_mangle] // stable symbol: fastpath-audit measures the switch by name
 pub unsafe extern "C" fn switch_to(old: *mut Context, new: *const Context) {
     naked_asm!(
         "push rbp",
@@ -170,7 +213,11 @@ pub unsafe extern "C" fn switch_to(old: *mut Context, new: *const Context) {
         "pop r12",
         "pop rbx",
         "pop rbp",
-        "ret"
+        "ret",
+        // End marker: fastpath-audit measures the switch by label range
+        // (naked-asm symbols carry no ELF size).
+        ".globl redos_switch_to_end",
+        "redos_switch_to_end:"
     )
 }
 
@@ -206,6 +253,106 @@ pub fn spawn_at(entry_addr: u64, arg: u64) -> usize {
     }
     task.state = TaskState::Runnable;
     idx
+}
+
+/// Spawn a RING-3 user task: on first schedule, `user_trampoline` loads
+/// this task's kernel-stack top into the syscall entry cell, then irets
+/// into ring 3 at `rip` with `rsp` (the ELF loader's user stack) and the
+/// capability slot in RDI (the program's single bootstrap argument — the
+/// "argv" of a zero-ID program is its authority handle, minted by the
+/// spawner before the task ever runs).
+///
+/// Stack image (ascending): [s]=trampoline [s+8]=kstack_top [s+16]=rip
+/// [s+24]=rsp [s+32]=cap_arg, ctx.rsp = s-48 — same discipline as spawn.
+/// The caller MUST have set task.cr3/pcid BEFORE the first switch (the
+/// spawner does: identity.rs installs the ELF-loaded root).
+/// CEP: CEP-1 | Complete
+/// Cost: O(1) image construction.
+/// Fail: panics if no free slot remains (named static capacity limit).
+/// Assumes: user windows already mapped in the task's root (elf.rs);
+///          GDT/TSS/syscall MSRs live (gdt.rs/syscall.rs).
+#[allow(dead_code)] // audit API: the scenario spawns via spawn_user_in (slot-scoped)
+pub fn spawn_user(rip: u64, rsp: u64, cap_arg: u64) -> usize {
+    let idx = match free_slot() {
+        Some(i) => i,
+        None => panic_str("spawn_user: no free task slot"),
+    };
+    spawn_user_in(idx, rip, rsp, cap_arg)
+}
+
+/// The lowest free task slot (skipping slot 0 — kmain's reservation).
+/// Exposed for the ELF spawner, which must resolve the slot BEFORE
+/// loading (the user stack window is slot-scoped).
+/// CEP: CEP-1 | Complete
+/// Cost: O(MAX_TASKS) scan.
+/// Fail: None when the table is full (named by the caller).
+pub fn free_slot() -> Option<usize> {
+    tasks()[1..]
+        .iter()
+        .position(|t| matches!(t.state, TaskState::Free))
+        .map(|i| i + 1)
+}
+
+/// spawn_user with a pre-reserved slot (the ELF spawner resolves the
+/// stack window from the slot index before loading the image). Marks the
+/// slot Runnable on return; the caller installs cr3/pcid immediately
+/// after (before the task is ever scheduled).
+/// CEP: CEP-1 | Complete
+/// Cost: O(1) image construction.
+/// Fail: panics if the reserved slot is not Free (wiring contract).
+pub fn spawn_user_in(idx: usize, rip: u64, rsp: u64, cap_arg: u64) -> usize {
+    let slots = tasks();
+    if !matches!(slots[idx].state, TaskState::Free) {
+        panic_str("spawn_user_in: reserved slot is not Free");
+    }
+    let task = &mut slots[idx];
+    let base = task.stack.as_mut_ptr() as u64;
+    let img_hi = base + STACK_SIZE as u64;
+    let kstack_top = img_hi; // 16 KiB-aligned: the syscall frame contract
+    let s = (img_hi - 48) & !0xF;
+    unsafe {
+        write_stack(s, user_trampoline as unsafe extern "C" fn() -> ! as u64);
+        write_stack(s + 8, kstack_top);
+        write_stack(s + 16, rip);
+        write_stack(s + 24, rsp);
+        write_stack(s + 32, cap_arg);
+        task.ctx.rsp = s - 48;
+    }
+    task.state = TaskState::Runnable;
+    idx
+}
+
+/// Ring-3 entry trampoline (runs once per user task, on its kernel
+/// stack, ring 0). Pops the spawn image, publishes the kernel-stack top
+/// for the syscall entry stub, builds the iret frame (user SS/RSP/
+/// RFLAGS/CS/RIP), and drops to ring 3. RFLAGS = 0x2 (IF=0: the no-
+/// interrupt kernel contract holds in user mode too — STI is privileged
+/// and faults to the containment path).
+///
+/// ABI CRITICAL: pops in image order (kstack_top, rip, rsp, cap_arg);
+/// the cap arg moves RDI←RSI so the user program receives it in RDI.
+/// CEP: CEP-0-candidate | Complete
+/// Cost: ~10 instructions, once per user task.
+/// Fail: a bad user CS/SS/stack faults immediately into containment
+///       (named); the constants are GDT-verified at gdt::init.
+/// Assumes: called via the switch_to resume path with the image on top.
+#[unsafe(naked)]
+unsafe extern "C" fn user_trampoline() -> ! {
+    naked_asm!(
+        "pop rdi",               // kstack top
+        "pop rcx",               // user rip
+        "pop rdx",               // user rsp
+        "pop rsi",               // cap arg
+        "mov [{kstk}], rdi",    // publish syscall-entry stack top
+        "mov rdi, rsi",         // user entry arg: rdi = cap slot
+        "push 0x23",            // ss = UDS|3
+        "push rdx",             // user rsp
+        "push 0x2",             // rflags (IF=0, reserved bit 1 set)
+        "push 0x1b",            // cs = UCS|3
+        "push rcx",             // user rip
+        "iretq",
+        kstk = sym crate::syscall::USR_KSTK
+    )
 }
 
 /// CEP: CEP-1 | Complete
@@ -267,11 +414,11 @@ unsafe fn write_stack(addr: u64, val: u64) {
 /// Switch to `next` from the current task, saving its context in `cur`.
 /// The target task's CR3 root is loaded BEFORE the stack switch (both
 /// contexts' code and the two Context structs live in the shared low
-/// identity map, so the CR3 load cannot strand us).
-/// CEP: CEP-1 | Complete
-/// Cost: one CR3 load (full TLB flush) + fixed ~15 instructions in the
-///       naked asm. Cycle measurement deferred to the fast-path milestone
-///       (where the switch path is rewritten with PCID anyway).
+/// identity map, so the CR3 load cannot strand us). The load is
+/// PCID-tagged noflush when the PCID/INVPCID pair is live (the measured
+/// optimization; pagemap.invalidate_root keeps revocation airtight).
+/// CEP: CEP-0-candidate | Complete
+/// Cost: one CR3 load + fixed ~15 instructions in the naked asm.
 /// Fail: cannot fail.
 /// Returns: when `cur` is later resumed by another switch back to it —
 /// the `ret` inside the naked asm lands back here, mid-call. That resume
@@ -282,13 +429,25 @@ pub fn switch_to_task(cur: usize, next: usize) {
     let slots = tasks();
     let root = slots[next].cr3;
     if root != 0 && root != crate::mm::pagemap::current_cr3() {
-        crate::mm::pagemap::switch_cr3(root);
+        crate::mm::pagemap::switch_cr3_pcid(root, slots[next].pcid, true);
     }
+    unsafe { CURRENT = next; }
     unsafe {
         let old_ctx = &mut slots[cur].ctx as *mut Context;
         let new_ctx = &slots[next].ctx as *const Context;
         switch_to(old_ctx, new_ctx);
     }
+}
+
+/// The rendezvous switch: transfer the CPU from `cur` DIRECTLY to `next`
+/// (the register fast path's delivery hop — no scheduler scan). Same
+/// mechanics as switch_to_task; a named wrapper so the fast path's cost
+/// is auditable as a unit (fastpath-audit counts it separately).
+/// CEP: CEP-0-candidate | Complete
+/// Cost: one CR3 load (PCID noflush) + switch_to's ~15 instructions.
+/// Fail: cannot fail.
+pub fn direct_switch(cur: usize, next: usize) {
+    switch_to_task(cur, next);
 }
 
 /// CEP: CEP-1 | Complete
@@ -416,7 +575,10 @@ pub fn schedule_from(cur: usize) {
         let stuck = slots.iter().any(|t| {
             matches!(
                 t.state,
-                TaskState::BlockedRecv(_) | TaskState::BlockedSend(_)
+                TaskState::BlockedRecv(_)
+                    | TaskState::BlockedSend(_)
+                    | TaskState::BlockedRecvFast(_)
+                    | TaskState::BlockedSendFast(_)
             )
         });
         if stuck {

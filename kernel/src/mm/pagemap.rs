@@ -20,10 +20,17 @@
 //! * PML4[225] — a second private slot (`PRIV_ALT`) used by the isolation
 //!               test as a page that exists in exactly one task's root.
 //!
-//! Revocation model: unmapping from a task's root + a full TLB flush on
-//! the next CR3 load (no PCID in Phase 2 — see mm/mod.rs scope notes)
-//! means the *next* access from that task takes a #PF. The idt.rs probe
-//! protocol turns that hardware trap into a named "Access Denied" event.
+//! Revocation model: unmapping from a task's root invalidates the TLB
+//! translation — `invlpg` on the current root, `invpcid` (type 2,
+//! root-tagged) on an inactive root when PCID is active, or the full
+//! flush of the next CR3 load in the no-PCID baseline (mm/mod.rs). The
+//! idt.rs probe protocol turns hardware traps into named denials.
+//!
+//! v0.8.0 additions: user/nx PTE bits (ring 3 + W^X), PCID/invpcid (the
+//! measured context-switch optimization — enabled ONLY as the pair,
+//! because noflush CR3 loads are only revocation-safe when stale entries
+//! can be invalidated precisely), per-task user code/stack windows, and
+//! `protect_kernel_text` (image-wide W^X: kernel text loses W).
 //!
 //! CEP: CEP-1 | Complete (Phase 2 scope)
 //! Cost: map O(1) (bounded 4-level walk, allocating missing tables);
@@ -50,10 +57,46 @@ pub const PRIV_BASE: u64 = 0x0000_7000_0000_0000;
 /// A second private slot (PML4[225]) — used by the isolation test as a
 /// page that exists in exactly one task's root.
 pub const PRIV_ALT: u64 = 0x0000_7080_0000_0000;
+/// Compositor screen window (PML4[230]) — the compositor's composed
+/// output; NO app root ever maps it (the glass wall's other direction).
+pub const GLASS_SCREEN: u64 = 0x0000_7300_0000_0000;
+/// User code window (PML4[252]): ELF64 program images load here. User
+/// VAs live in dedicated PML4 slots so a validated range check is a
+/// TOP-LEVEL check — a crafted p_vaddr outside the window is refused
+/// before any walk (elf.rs).
+pub const USER_CODE_BASE: u64 = 0x0000_7800_0000_0000;
+/// User stack window (PML4[253]); task slot i's stack top is
+/// `USER_STACK_BASE + i * USER_STACK_STRIDE` (16 KiB mapped, guard-banded
+/// by the unmapped VAs around it).
+pub const USER_STACK_BASE: u64 = 0x0000_7C00_0000_0000;
+pub const USER_STACK_STRIDE: u64 = 1 << 20;
+
+const PML4_USER_CODE: usize = (USER_CODE_BASE >> 39) as usize & 0x1FF; // 252
+const PML4_USER_STACK: usize = (USER_STACK_BASE >> 39) as usize & 0x1FF; // 253
+const _: () = assert!(PML4_USER_CODE != PML4_USER_STACK);
+const _: () = assert!(USER_STACK_BASE < 0x0000_8000_0000_0000);
 
 const PTE_P: u64 = 1 << 0;
 const PTE_W: u64 = 1 << 1;
+const PTE_U: u64 = 1 << 2;
 const PTE_PS: u64 = 1 << 7;
+/// Execute-disable (requires EFER.NXE = 1 — set by syscall::init_msr
+/// before any NX-bearing PTE is ever translated).
+const PTE_NX: u64 = 1 << 63;
+
+// --- PCID / invpcid (v0.8.0 measured optimization) ---------------------------
+
+static mut PCID_ACTIVE: bool = false;
+/// Kernel root's PCID tag (1; 0 is avoided — CR3 loads of PCID 0 with
+/// bit63 set are UNDEFINED-behavior territory per SDM Vol.3 4.10.1).
+const KERNEL_PCID: u16 = 1;
+static mut NEXT_PCID: u16 = KERNEL_PCID + 1;
+/// Root → PCID registry (roots are frame-aligned; ≤ MAX_TASKS + 1 roots
+/// exist; a linear scan of 14 entries beats a map for this scale).
+static mut ROOT_PCID: [(u64, u16); 16] = [(0, 0); 16];
+static mut ROOT_PCID_N: usize = 0;
+
+const ROOT_PCID_CAP: usize = 16;
 
 /// PML4 indices for the fixed windows. Derived once here; the asserts
 /// guarantee the three windows live in distinct top-level slots (so a
@@ -128,9 +171,194 @@ unsafe fn leaf_check(entry: u64, what: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// CPUID leaf 1 ECX bit 17: Process Context Identifiers.
+/// CEP: CEP-1 | Complete
+/// Cost: one cpuid.
+/// Fail: cannot fail (returns the capability bit).
+fn cpu_has_pcid() -> bool {
+    let ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "pop rbx",
+            lateout("ecx") ecx,
+            lateout("eax") _,
+            lateout("edx") _,
+            options(nostack)
+        );
+    }
+    ecx & (1 << 17) != 0
+}
+
+/// CPUID leaf 7 subleaf 0 EBX bit 10: INVPCID instruction.
+/// CEP: CEP-1 | Complete
+/// Cost: one cpuid.
+/// Fail: cannot fail.
+fn cpu_has_invpcid() -> bool {
+    let ebx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 7",
+            "xor ecx, ecx",
+            "cpuid",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) ebx,
+            lateout("eax") _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            options(nostack)
+        );
+    }
+    ebx & (1 << 10) != 0
+}
+
+/// Whether PCID-aware (noflush) CR3 loads are live. TRUE only when the
+/// CPU has BOTH PCID and INVPCID: the noflush switch is only revocation-
+/// safe if stale translations can be invalidated precisely (see the
+/// invalidation paths below). Without the pair we keep the full-flush
+/// baseline — the safe default, honestly measured either way.
+/// CEP: CEP-1 | Complete
+/// Cost: one load. Fail: cannot fail.
+pub fn pcid_active() -> bool {
+    unsafe { PCID_ACTIVE }
+}
+
+/// Enable the PCID + INVPCID pair (CR4.PGE first — the SDM's constraint
+/// for setting CR4.PCIDE — then PCIDE). Registers the kernel root under
+/// its PCID tag.
+/// CEP: CEP-1 | Complete
+/// Cost: one-time boot path.
+/// Fail: cannot fail (absent features leave the baseline untouched).
+/// Assumes: called once, after pagemap::init (the kernel root exists).
+pub fn init_pcid() {
+    let has_p = cpu_has_pcid();
+    let has_i = cpu_has_invpcid();
+    if !has_p || !has_i {
+        unsafe { PCID_ACTIVE = false };
+        serial::print(format_args!(
+            "[mm] PCID/INVPCID: {} / {} — full-flush baseline kept (safe)\n",
+            if has_p { "yes" } else { "no" },
+            if has_i { "yes" } else { "no" }
+        ));
+        return;
+    }
+    unsafe {
+        let mut cr4: u64;
+        core::arch::asm!("mov {0}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        cr4 |= 1 << 7; // PGE (prerequisite for PCIDE)
+        core::arch::asm!("mov cr4, {0}", in(reg) cr4, options(nostack, preserves_flags));
+        let mut cr4b: u64;
+        core::arch::asm!("mov {0}, cr4", out(reg) cr4b, options(nomem, nostack, preserves_flags));
+        cr4b |= 1 << 17; // PCIDE
+        core::arch::asm!("mov cr4, {0}", in(reg) cr4b, options(nostack, preserves_flags));
+        PCID_ACTIVE = true;
+        register_root_pcid(kernel_root(), KERNEL_PCID);
+    }
+    serial::print(format_args!(
+        "[mm] PCID+INVPCID live: kernel root pcid {}, noflush root switches armed\n",
+        KERNEL_PCID
+    ));
+}
+
+/// Bind a physical root to a PCID tag (call once per new root).
+/// CEP: CEP-1 | Complete
+/// Cost: O(1) append (table of 16).
+/// Fail: panics when the registry is full — capacity is bound by
+///       MAX_TASKS + 1 and MUST NOT wrap silently (PCID reuse without a
+///       flush serves stale translations: a revocation-safety hole).
+fn register_root_pcid(root: u64, pcid: u16) {
+    unsafe {
+        if ROOT_PCID_N >= ROOT_PCID_CAP {
+            panic_str("PCID registry exhausted — increase ROOT_PCID (no silent tag reuse)");
+        }
+        ROOT_PCID[ROOT_PCID_N] = (root, pcid);
+        ROOT_PCID_N += 1;
+    }
+}
+
+/// The PCID tag bound to `root` (0 = unregistered: flush-mode loads).
+/// CEP: CEP-1 | Complete
+/// Cost: O(REGISTRY_N) scan (≤ 16 entries).
+/// Fail: cannot fail (0 is the honest answer for unregistered roots).
+pub fn pcid_of(root: u64) -> u16 {
+    unsafe {
+        for i in 0..ROOT_PCID_N {
+            if ROOT_PCID[i].0 == root {
+                return ROOT_PCID[i].1;
+            }
+        }
+    }
+    0
+}
+
+/// Allocate the next free PCID tag for a fresh task root.
+/// CEP: CEP-1 | Complete
+/// Cost: O(1).
+/// Fail: returns 0 (flush-mode) once the 12-bit space nears exhaustion —
+///       a NAMED degradation, never a silent tag reuse.
+pub fn alloc_pcid() -> u16 {
+    unsafe {
+        if NEXT_PCID >= 0xFFF {
+            return 0; // flush-mode fallback; documented, safe
+        }
+        let p = NEXT_PCID;
+        NEXT_PCID += 1;
+        p
+    }
+}
+
+/// INVPCID type 2: invalidate the translation of `vaddr` for `pcid`.
+/// CEP: CEP-1 | Complete
+/// Cost: one instruction.
+/// Fail: cannot fail (type 2 is a fixed constant; the CPU enforces the
+///       descriptor's canonical checks for us).
+/// Assumes: safe regardless of PCID_ACTIVE — on an inactive system every
+///          CR3 load flushes everything, so the extra invalidate is moot.
+#[inline]
+fn invpcid_addr(pcid: u16, vaddr: u64) {
+    let desc: [u64; 2] = [(pcid as u64) | (vaddr & !0xFFF), 0];
+    unsafe {
+        core::arch::asm!(
+            // INVPCID type 2, descriptor at [rdx]: 66 0F 38 82 /r.
+            // (GAS refuses the `invpcid eax, [rdx]` spelling — the
+            // instruction's 66-prefixed encoding is emitted by hand,
+            // verified against objdump: 66 0f 38 82 02.)
+            ".byte 0x66, 0x0F, 0x38, 0x82, 0x02",
+            in("rdx") desc.as_ptr(),
+            out("eax") _,
+            options(nostack)
+        );
+    }
+}
+
+/// Load CR3 with the root's PCID tag. noflush = keep the incoming root's
+/// cached translations (the optimization: a root switch becomes ~free).
+/// Revocation safety contract: EVERY unmap/reflag on a non-current root
+/// invalidates via invpcid (below), so noflush loads never resurrect a
+/// dead translation. pcid 0 / inactive PCID = plain CR3 load (full flush).
+/// CEP: CEP-1 | Complete
+/// Cost: one mov (flush) or one mov + the retained TLB (noflush).
+/// Fail: cannot fail.
+#[inline]
+pub fn switch_cr3_pcid(root: u64, pcid: u16, noflush: bool) {
+    let mut val = root;
+    if pcid_active() && pcid != 0 {
+        val |= pcid as u64;
+        if noflush {
+            val |= 1 << 63;
+        }
+    }
+    unsafe {
+        core::arch::asm!("mov cr3, rax", in("rax") val, options(nostack, preserves_flags));
+        CURRENT_CR3 = root;
+    }
+}
+
 fn cpu_has_1g_pages() -> bool {
-    // cpuid clobbers rbx, which LLVM reserves on this target — save/restore
-    // it inside the asm and hand the value out through an allocated reg.
     let ebx_out: u32;
     let d: u32;
     unsafe {
@@ -165,13 +393,48 @@ pub fn init() {
         .unwrap_or_else(|| panic_str("pagemap: root alloc failed"));
 
     // --- PML4[0]: low identity, 512 MiB via 2 MiB pages -------------------
-    let pd_low = phys::alloc(PageClass::General)
-        .unwrap_or_else(|| panic_str("pagemap: low PD alloc failed"));
     unsafe {
-        table(root)[0] = pd_low | PTE_P | PTE_W;
+        // STRUCTURAL NOTE (the v0.8.0 W^X milestone caught this): the
+        // walk under PML4[0] is PML4 -> PDPT -> PD -> PT. The v0.5.0
+        // draft pointed PML4[0] straight at a table of 2 MiB entries —
+        // which the CPU reads as a PDPT whose PS bit means **1 GiB** —
+        // so the whole low identity was accidentally ONE giant RW 1 GiB
+        // page (it "worked" because entry 0's address field is 0). The
+        // text could never be write-protected and every "2 MiB leaf"
+        // edit below PML4[0] edited the wrong level. Fixed here: the
+        // PDPT level is explicit, the PD holds the 2 MiB leaves, and the
+        // kernel-image leaf is a 4 KiB PT with the text RO FROM BIRTH
+        // (no large-page entry for the region ever exists, so the W^X
+        // verification needs no TLB eviction dance at all).
+        let pdpt_low = phys::alloc(PageClass::General)
+            .unwrap_or_else(|| panic_str("pagemap: low PDPT alloc failed"));
+        let pd_low = phys::alloc(PageClass::General)
+            .unwrap_or_else(|| panic_str("pagemap: low PD alloc failed"));
+        table(root)[0] = pdpt_low | PTE_P | PTE_W;
+        // PDPT[0] covers VAs [0, 1 GiB).
+        table(pdpt_low)[0] = pd_low | PTE_P | PTE_W;
         let pd = table(pd_low);
+        // 2 MiB leaves: the correct level for PS=1 with 2 MiB granularity.
         for i in 0..256usize {
             pd[i] = (i as u64) * (2 << 20) | PTE_P | PTE_W | PTE_PS;
+        }
+        // The kernel-image leaf ([0x200000, 0x400000)) is a 4 KiB PT, and
+        // the text span is read-only FROM BIRTH: the first walk through
+        // this root already sees RO text (the W^X tenet, image-wide).
+        let img_pt = phys::alloc(PageClass::General)
+            .unwrap_or_else(|| panic_str("pagemap: image PT alloc failed"));
+        pd[1] = img_pt | PTE_P | PTE_W; // PS cleared: 4 KiB granularity
+        let t0 = &__text_start as *const u8 as u64;
+        let t1 = &__text_end as *const u8 as u64;
+        let img_base = 0x20_0000u64;
+        for i in 0..512usize {
+            let frame = img_base + (i as u64) * PAGE_SIZE;
+            table(img_pt)[i] = frame | PTE_P | PTE_W;
+        }
+        let first = (t0 - img_base) / PAGE_SIZE;
+        let last = (t1 - img_base + PAGE_SIZE - 1) / PAGE_SIZE;
+        for i in first..last {
+            table(img_pt)[i as usize] &= !PTE_W; // text: RO from birth
         }
     }
 
@@ -253,6 +516,8 @@ pub fn new_task_root() -> Result<u64, &'static str> {
         tr[0] = kr[0];
         tr[256] = kr[256];
     }
+    // PCID tag for the noflush switch path (0 = flush-mode fallback).
+    register_root_pcid(root, alloc_pcid());
     Ok(root)
 }
 
@@ -274,7 +539,9 @@ pub fn invlpg_current(vaddr: u64) {
     }
 }
 
+/// (superseded by `invalidate_root` — kept for the doc trail; unused)
 /// If `root` is the currently loaded CR3, invalidate `vaddr` in the TLB.
+#[allow(dead_code)]
 #[inline]
 fn invalidate_if_current(root: u64, vaddr: u64) {
     if root == current_cr3() {
@@ -283,7 +550,7 @@ fn invalidate_if_current(root: u64, vaddr: u64) {
 }
 
 /// Map one 4 KiB page `vaddr → phys_frame` in the given root, creating
-/// intermediate tables as needed.
+/// intermediate tables as needed (supervisor wrapper over `map_page_ex`).
 ///
 /// CEP: CEP-1 | Complete
 /// Cost: O(1) bounded walk; ≤ 3 table allocations on first touch of a
@@ -291,42 +558,79 @@ fn invalidate_if_current(root: u64, vaddr: u64) {
 /// Fail: Err on a populated PTE (remapping authority is explicit, never
 ///       silent) or allocator exhaustion.
 pub fn map_page(root: u64, vaddr: u64, phys_frame: u64, write: bool) -> Result<(), &'static str> {
+    map_page_ex(root, vaddr, phys_frame, write, false, false)
+}
+
+/// The full-flag map: `user` sets PTE.U (ring 3 may translate), `nx`
+/// sets PTE.NX (EFER.NXE required — see syscall.rs). W^X discipline for
+/// user images lives at the CALLER (elf.rs): text = !write && !nx,
+/// data/stack = write && nx.
+///
+/// U-PROPAGATION: the MMU requires PTE.U at EVERY level of the walk — a
+/// user leaf under supervisor intermediates still faults (observed in
+/// v0.8.0 bring-up: the entry fetch died with e=0x15). When `user` is
+/// set, every intermediate entry on the walk gets U ored in — including
+/// already-present ones (a supervisor mapping may have created them).
+///
+/// CEP: CEP-1 | Complete
+/// Cost: O(1) bounded walk; ≤ 3 table allocations on first touch.
+/// Fail: Err on a populated PTE or allocator exhaustion.
+pub fn map_page_ex(
+    root: u64,
+    vaddr: u64,
+    phys_frame: u64,
+    write: bool,
+    user: bool,
+    nx: bool,
+) -> Result<(), &'static str> {
     if vaddr % PAGE_SIZE != 0 || phys_frame % PAGE_SIZE != 0 {
         return Err("pagemap: unaligned map");
     }
-    let flags = PTE_P | if write { PTE_W } else { 0 };
+    let mut flags = PTE_P | if write { PTE_W } else { 0 };
+    if user {
+        flags |= PTE_U;
+    }
+    if nx {
+        flags |= PTE_NX;
+    }
+    let u_flag = if user { PTE_U } else { 0 };
     unsafe {
         let pml4 = table(root);
         let e4 = pml4[idx4(vaddr)];
         let pdpt_phys = if e4 & PTE_P != 0 {
+            if u_flag != 0 && e4 & PTE_U == 0 {
+                pml4[idx4(vaddr)] = e4 | PTE_U; // U-propagation (see docs)
+            }
             e4 & !0xFFF
         } else {
             let f = phys::alloc(PageClass::General).ok_or("pagemap: PDPT alloc failed")?;
-            pml4[idx4(vaddr)] = f | PTE_P | PTE_W;
+            pml4[idx4(vaddr)] = f | PTE_P | PTE_W | u_flag;
             f
         };
         let pdpt = table(pdpt_phys);
         let e3 = pdpt[idx3(vaddr)];
-        if e3 & PTE_P != 0 {
-            leaf_check(e3, "PDPT")?;
-        }
         let pd_phys = if e3 & PTE_P != 0 {
+            leaf_check(e3, "PDPT")?;
+            if u_flag != 0 && e3 & PTE_U == 0 {
+                pdpt[idx3(vaddr)] = e3 | PTE_U;
+            }
             e3 & !0xFFF
         } else {
             let f = phys::alloc(PageClass::General).ok_or("pagemap: PD alloc failed")?;
-            pdpt[idx3(vaddr)] = f | PTE_P | PTE_W;
+            pdpt[idx3(vaddr)] = f | PTE_P | PTE_W | u_flag;
             f
         };
         let pd = table(pd_phys);
         let e2 = pd[idx2(vaddr)];
-        if e2 & PTE_P != 0 {
-            leaf_check(e2, "PD")?;
-        }
         let pt_phys = if e2 & PTE_P != 0 {
+            leaf_check(e2, "PD")?;
+            if u_flag != 0 && e2 & PTE_U == 0 {
+                pd[idx2(vaddr)] = e2 | PTE_U;
+            }
             e2 & !0xFFF
         } else {
             let f = phys::alloc(PageClass::General).ok_or("pagemap: PT alloc failed")?;
-            pd[idx2(vaddr)] = f | PTE_P | PTE_W;
+            pd[idx2(vaddr)] = f | PTE_P | PTE_W | u_flag;
             f
         };
         let pt = table(pt_phys);
@@ -373,7 +677,7 @@ pub fn reflag_page(root: u64, vaddr: u64, write: bool) -> Result<(), &'static st
     }
     // TLB coherence: a demotion on the CURRENT root must evict the stale
     // RW translation, or the CPU keeps granting the old permission.
-    invalidate_if_current(root, vaddr);
+    invalidate_root(root, vaddr);
     Ok(())
 }
 
@@ -410,10 +714,31 @@ pub fn unmap_page(root: u64, vaddr: u64) -> Result<(), &'static str> {
     }
     // TLB coherence: an unmap on the CURRENT root must evict the stale
     // translation, or the revoked task keeps reading through it.
-    invalidate_if_current(root, vaddr);
-    // Full-flush CR3 model: the revoked task's stale TLB entries also die
-    // on its next CR3 load (no PCID in Phase 2 — mm/mod.rs scope notes).
+    invalidate_root(root, vaddr);
+    // PCID model: an INACTIVE root's stale entries die at invalidate time
+    // (invpcid below) — noflush CR3 loads can then never resurrect them
+    // (proof/Fastpath.thy: tlb_ok obligation). Flush-mode baseline: the
+    // full flush on the owner's next CR3 load.
     Ok(())
+}
+
+/// Invalidate one page's translation for `root`'s address space: invlpg
+/// when the root is loaded, invpcid(type 2, root tag) when PCID is active
+/// and the root is inactive, and nothing when neither holds (flush-mode
+/// baseline: the owner's next CR3 load is a full flush).
+/// CEP: CEP-1 | Complete
+/// Cost: one instruction.
+/// Fail: cannot fail.
+#[inline]
+fn invalidate_root(root: u64, vaddr: u64) {
+    if root == current_cr3() {
+        invlpg_current(vaddr);
+    } else if pcid_active() {
+        let pcid = pcid_of(root);
+        if pcid != 0 {
+            invpcid_addr(pcid, vaddr);
+        }
+    }
 }
 
 /// Whether `vaddr` is mapped in `root` (audit helper; O(1)).
@@ -448,4 +773,27 @@ pub fn is_mapped(root: u64, vaddr: u64) -> bool {
 #[cold]
 fn panic_str(msg: &str) -> ! {
     crate::panic_str("pagemap: ", msg)
+}
+
+// --- Image-wide W^X (v0.8.0 paging item promised at v0.7.0) ------------------
+
+extern "C" {
+    /// Linker-provided kernel text bounds (linker.ld).
+    static __text_start: u8;
+    /// Linker-provided kernel text bounds (linker.ld).
+    static __text_end: u8;
+}
+
+/// Verify the image-wide W^X (the demotion happened at `init` — see the
+/// pagemap::init notes): probe-write a text byte; the MMU must deny it.
+/// Returns true when the text is genuinely read-only.
+///
+/// CEP: CEP-1 | Complete
+/// Cost: one probe.
+/// Fail: returns false (the caller prints the FAIL line — a writable
+///       text is a build-ordering regression, never silent).
+/// Assumes: called after pagemap::init; interrupts disabled.
+pub fn verify_kernel_text_ro() -> bool {
+    let t0 = unsafe { &__text_start as *const u8 as u64 };
+    !crate::mm::idt::probe_write(t0 + 8, 0x9999)
 }

@@ -173,3 +173,76 @@ manager (Phase 4).
 | **Total (shippable)** | **~170,000–220,000** | — |
 
 Live counts: run `make loc`.
+
+## v0.8.0 — IPC fast path, ring 3, and the Glass Wall
+
+### The ring boundary
+
+GDT: `0x00` null | `0x08` kcode | `0x10` kdata | `0x18` ucode (L, DPL3)
+| `0x20` udata (DPL3) | `0x28` TSS (packed 104-byte layout, RSP0 at
+offset 4 — the same trap class as the packed IDTR). STAR names 0x08 for
+SYSCALL and 0x28 for SYSRET (CS = (0x28-16)|3 = 0x1b, SS = 0x23).
+SFMASK = TF|IF|DF|IOPL|NT|AC. The syscall frame is 18 pushes from the
+16-byte-aligned kernel stack top; the LAST pop is `pop rsp` — user_rsp
+lives in the frame because SYSRET does not restore RSP.
+
+### The fast path
+
+```
+user: syscall (rax=2, r10=cap, rdi/rsi/rdx/r8/r9 = payload)
+  entry stub (47 instrs) -> dispatch (56) -> sys_send hot path (84)
+  -> [cap check] -> deliver 5 words into the parked frame
+  -> direct_switch (15) -> receiver resumes mid-dispatch -> exit stub
+  -> sysretq with the payload in the registers
+```
+
+Blindness layering: fastpath.rs moves `[u64; 5]` opaquely; the
+verification of the payload lives in the user programs (srv.elf checks
+its own protocol constants; the router has no reference to them). The
+boot log's PASS lines therefore certify delivery without the kernel
+ever reading a payload word.
+
+Budget evidence (`make fastpath-audit`, objdump over exact `nm -S`
+sizes, ceiling 300, build fails on regression):
+
+| segment | instructions |
+|---|---|
+| entry stub | 47 |
+| dispatch | 56 |
+| sys_send (hot) | 84 |
+| sys_recv (hot) | 75 |
+| switch_to (fixed) | 15 |
+| whole-rendezvous total | 277 |
+
+The TSC benches in the boot log are QEMU-TCG-relative context, not
+hardware cycle claims.
+
+### PCID policy
+
+PCID is enabled ONLY when the CPU has both PCID and INVPCID: a noflush
+CR3 load is revocation-safe only if stale entries can be invalidated
+precisely, which is what unmap/reflag do via invpcid type 2 per
+(root, page) on inactive roots (invlpg on the current root). Without
+the pair, the full-flush baseline stands. Fastpath.thy formalizes the
+obligation and its hazard (switches never discharge it).
+
+### The Glass Wall
+
+Painter: RW surface (shm block, own root). Compositor: RO pane of the
+same block (share_ro — owner keeps RW) + a private RW screen. Probes:
+pane write denied (content integrity is the app's), app-private read
+denied (the compositor sees only the glass), screen read denied to the
+app (the presentation side is compositor-private). Fastpath.thy: the
+pane set grows only through grants, panes are read-only by
+construction, revocation denies until a fresh grant.
+
+### The low-identity structure fix (bring-up forensics)
+
+The v0.5.0 draft pointed PML4[0] straight at a table of 2 MiB entries.
+The CPU reads that level as a PDPT, whose PS bit means 1 GiB — so the
+low identity was ONE giant RW 1 GiB page (it worked because entry 0's
+address field is 0). Consequence: kernel text could never be
+write-protected, and every edit "below PML4[0]" edited the wrong level.
+The v0.8.0 image-wide W^X milestone exposed it; the PDPT level is now
+explicit (PML4[0] -> PDPT -> PD -> 2 MiB leaves; the kernel-image leaf
+is a 4 KiB PT with the text RO from the first walk).

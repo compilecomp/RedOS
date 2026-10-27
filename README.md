@@ -63,6 +63,7 @@ QEMU + OVMF + mtools for boot tests (added with the v0.2.0 milestone).
 | v0.5.0  | Memory physics: paging, ephemeral allocator, wipe protocol, zero-copy SHM + MMU-enforced revocation (Phase 2 open) | memphy ✓  |
 | v0.6.0  | RAM-only KMS vault: BLAKE2b + Argon2id (RFC 9106 KAT) + XTS-AES-256 (IEEE 1619 KAT), sealed-blob PIN unlock in Locked frames, wrong-PIN dead-man wipe, tick leases, XTS RAM disk | kms ✓     |
 | v0.7.0  | Zero-ID identity: MAC'd manifest schema (content-hash bound), sandbox spawner (fresh root + RO code window), default-deny grants, operator prompt handshake, append-only Permission Tracker, input service (no PIN constants), strict-RNG policy; REPAIRS two latent CI failures carried since v0.4/v0.5 (see note) | idnt ✓    |
+| v0.8.0  | IPC fast path + Glass Wall (Phase 2 close): GDT/TSS + syscall/sysret ring 3, ELF64 user binaries (W^X loader), blind register rendezvous with direct switch, PCID+INVPCID measured optimization, kernel-text RO from birth (fixes the latent 1-GiB-page low-identity bug), compositor read-only panes (MMU-proven both directions), ring-3 fault containment | fastpath ✓ |
 
 **CI honesty note (v0.7.0).** The ✓ marks above are v0.7.0's local-plus-CI
 status. The v0.3.0–v0.6.0 pushes shipped while CI was in fact red — the

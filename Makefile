@@ -32,9 +32,40 @@ CRYPTO_OBJ   := $(CRYPTO_SRC:crypto/src/%.c=build/%.o)
 CRYPTO_LIB   := build/libredcrypto.a
 KERNEL_ELF   := kernel/target/x86_64-unknown-none/release/redos-kernel
 
-.PHONY: all crypto-test freestanding-check kernel bootloader image qemu \
-	boot-test secret-audit loc clean
+# User program bases: one 2 MiB slot per program inside the user code
+# window (PML4[252] = 0x7800_0000_0000) - MUST match
+# kernel/src/identity.rs (SRV_BASE/CLI_BASE/FAULTY_BASE).
+USR_CODE_BASE := 0x780000000000
+SRV_BASE      := 0x780000200000
+CLI_BASE      := 0x780000400000
+FAULTY_BASE   := 0x780000600000
+# Freestanding static user images: large code model (VAs far above 2
+# GiB), no PIE, W^X enforced by the linker script's PHDRS flags.
+USR_CFLAGS := -nostdlib -static -ffreestanding -fno-pic -fno-pie -mcmodel=large \
+              -fno-stack-protector -fcf-protection=none -O2 -Wall -Wextra \
+              -Werror -Iusr
+
+.PHONY: all crypto-test freestanding-check usr-programs kernel bootloader image qemu \
+	boot-test secret-audit fastpath-audit loc clean
 all: crypto-test freestanding-check kernel bootloader
+
+build/usr/srv.elf: usr/srv.c usr/sys.h usr/crt0.S usr/link.ld | build/usr
+	$(CC) $(USR_CFLAGS) -T usr/link.ld -Wl,--defsym=USR_BASE=$(SRV_BASE) \
+		-o $@ usr/crt0.S usr/srv.c
+
+build/usr/cli.elf: usr/cli.c usr/sys.h usr/crt0.S usr/link.ld | build/usr
+	$(CC) $(USR_CFLAGS) -T usr/link.ld -Wl,--defsym=USR_BASE=$(CLI_BASE) \
+		-o $@ usr/crt0.S usr/cli.c
+
+build/usr/faulty.elf: usr/faulty.c usr/sys.h usr/crt0.S usr/link.ld | build/usr
+	$(CC) $(USR_CFLAGS) -T usr/link.ld -Wl,--defsym=USR_BASE=$(FAULTY_BASE) \
+		-o $@ usr/crt0.S usr/faulty.c
+
+usr-programs: build/usr/srv.elf build/usr/cli.elf build/usr/faulty.elf
+	@echo "USR-PROGRAMS OK (srv cli faulty: static ELF64, W^X segments)"
+
+build/usr:
+	mkdir -p build/usr
 
 build/%.o: crypto/src/%.c crypto/include/red/crypto.h \
 	   crypto/include/red/blake2b.h crypto/include/red/argon2.h \
@@ -76,7 +107,8 @@ freestanding-check: | build
 # Rust no_std microkernel (zero third-party deps in Phase 1)
 # NOTE: build from kernel/ so cargo picks up kernel/.cargo/config.toml
 # (target pin, linker script). --manifest-path from the root would skip it.
-kernel: | build
+# The user ELFs are embedded (include_bytes!) - build them FIRST.
+kernel: usr-programs | build
 	$(CC) $(FREE_CFLAGS) -c crypto/src/aes.c -o build/aes.free.o
 	$(CC) $(FREE_CFLAGS) -c crypto/src/gcm.c -o build/gcm.free.o
 	$(CC) $(FREE_CFLAGS) -c crypto/src/blake2b.c -o build/blake2b.free.o
@@ -118,6 +150,33 @@ boot-test: image
 # hardware; the CI feeder types the documented test PIN). The wrong-PIN
 # vector inside the kernel is a public counter-probe input, not a secret.
 # The CI feeder's PIN lives in scripts/boot_test.sh — test-harness data.
+# Fast-path instruction-budget audit (v0.8.0): the 100-cycle-per-hop
+# budget's hard evidence. TCG cannot certify hardware cycles, but the
+# PATH LENGTH is a build artifact: count the instructions between the
+# syscall entry stub, the dispatch, and the fast-path send handler in
+# the LINKED kernel (objdump). A regressed (bloated) fast path fails
+# this target, not a reviewer's patience. Budget: 200 per hop (entry +
+# dispatch + exit ~ 100 at >=1 IPC/cycle; the send handler adds the cap
+# check + delivery; the ceiling is documented in docs/ARCHITECTURE.md).
+fastpath-audit: kernel
+	@if [ ! -f "$(KERNEL_ELF)" ]; then echo "FASTPATH-AUDIT FAILED: kernel ELF missing"; exit 1; fi; \
+	 nm $$(pwd)/$(KERNEL_ELF) | awk '{print $$1, $$3}' | sort > build/fastpath.syms; \
+	 addr_of() { grep " $$1$$" build/fastpath.syms | awk '{print $$1}'; }; \
+	 count_range() { objdump -d --start-address=0x$$1 --stop-address=0x$$2 $(KERNEL_ELF) 2>/dev/null | grep -cE '^[[:space:]]*[0-9a-f]+:'; }; \
+	 count_fn() { zhex=$$(nm -S --defined-only $$(pwd)/$(KERNEL_ELF) | grep " $$1$$" | awk '{print $$2}'); \
+	   if [ -z "$$zhex" ]; then echo "FASTPATH-AUDIT FAILED: $$1 has no ELF size"; exit 1; fi; \
+	   z=$$((0x$$zhex)); a=$$(addr_of $$1); \
+	   objdump -d --start-address=0x$$a --stop-address=$$((0x$$a + $$z)) $(KERNEL_ELF) 2>/dev/null | grep -cE '^[[:space:]]*[0-9a-f]+:'; }; \
+	 E=$$(count_range $$(addr_of redos_syscall_entry) $$(addr_of redos_syscall_end)); \
+	 W=$$(count_range $$(addr_of switch_to) $$(addr_of redos_switch_to_end)); \
+	 D=$$(count_fn redos_syscall_dispatch); \
+	 S=$$(count_fn redos_fp_sys_send); \
+	 R=$$(count_fn redos_fp_sys_recv); \
+	 TOTAL=$$((E + D + S + R + W)); \
+	 echo "FASTPATH-AUDIT: entry-stub=$$E, dispatch=$$D, sys_send=$$S, sys_recv=$$R, switch_to=$$W"; \
+	 echo "FASTPATH-AUDIT: conservative whole-rendezvous total = $$TOTAL instructions (budget 300)"; \
+	 if [ $$TOTAL -gt 300 ]; then echo "FASTPATH-AUDIT FAILED: fast path exceeds the 300-instruction ceiling"; exit 1; fi
+
 secret-audit: kernel
 	@if grep -aq "sovereign-pin" build/redos.bin; then echo "SECRET-AUDIT FAILED: operator PIN string found in kernel binary"; exit 1; fi; echo "SECRET-AUDIT OK (no operator PIN in kernel binary; wrong-pin vector is public by design)"
 

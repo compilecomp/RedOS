@@ -11,7 +11,7 @@
 
 /// Declared kernel external surface (substring-level names; the audit
 /// scans for storage-path indicators: ahci/nvme/ata_/sdhci).
-pub const EXPORTED_SYMBOLS: [&str; 9] = [
+pub const EXPORTED_SYMBOLS: [&str; 12] = [
     "uart16550(port-io)",       // serial console (the only I/O)
     "uart16550(rx-input)",      // operator input service (v0.7.0: polled RX,
                                 //  masked-echo PIN entry, no secret constants)
@@ -29,4 +29,13 @@ pub const EXPORTED_SYMBOLS: [&str; 9] = [
                                 //  manifests, sandbox spawner, Permission
                                 //  Tracker, operator prompt handshake — no
                                 //  IDs, no PKI, vault-anchored trust)
+    "syscomm(sysret-fastpath)", // v0.8.0: syscall/sysret ring boundary,
+                                //  register fast path (blind payload
+                                //  routing), ring-3 ELF tasks, fault
+                                //  containment — no port I/O, no DMA
+    "glass(compositor-ro)",     // v0.8.0: compositor with read-only panes;
+                                //  display path is RAM frames only
+    "pcid(invlpg-type2)",       // v0.8.0: PCID+INVPCID pair (TLB
+                                //  invalidation obligation; full-flush
+                                //  baseline when the pair is absent)
 ];
